@@ -1,0 +1,15 @@
+
+[package]
+name = "omarchy-cert-tui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+chrono.workspace = true
+omarchy-cert-core = { path = "../core" }

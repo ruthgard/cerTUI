@@ -1,0 +1,14 @@
+
+[package]
+name = "omarchy-cert-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+omarchy-cert-core = { path = "../core" }

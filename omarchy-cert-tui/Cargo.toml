@@ -1,0 +1,25 @@
+
+[workspace]
+members = ["crates/core", "crates/cli", "crates/tui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["You <you@example.com>"]
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["clock"] }
+pem = "3"
+x509-parser = { version = "0.15", default-features = false, features = ["verify"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
+# TUI deps (used in tui crate)
+ratatui = "0.26"
+crossterm = "0.27"
+clap = { version = "4", features = ["derive"] }
