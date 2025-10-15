@@ -13,3 +13,5 @@ ratatui.workspace = true
 crossterm.workspace = true
 chrono.workspace = true
 omarchy-cert-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true

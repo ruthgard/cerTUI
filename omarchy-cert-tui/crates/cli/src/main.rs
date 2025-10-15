@@ -1,11 +1,9 @@
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use chrono::Utc;
-use omarchy_cert_core::{inspect_remote, days_until_expiry};
+use omarchy_cert_core::{days_until_expiry, inspect_remote};
 
 #[derive(Parser)]
-#[command(name="omarchy-cert-cli")]
+#[command(name = "omarchy-cert-cli")]
 #[command(about="Certificate inspector (CLI) for Omarchy", long_about=None)]
 struct Cli {
     #[command(subcommand)]
@@ -43,12 +41,20 @@ fn main() -> Result<()> {
         Commands::Inspect { target, sni } => {
             let (host, port) = split_target(&target)?;
             let report = inspect_remote(host, port, sni.as_deref())?;
-            println!("Host: {}:{} (SNI: {:?})", report.host, report.port, report.sni);
+            println!(
+                "Host: {}:{} (SNI: {:?})",
+                report.host, report.port, report.sni
+            );
             if let Some(leaf) = report.certs.first() {
                 let days = days_until_expiry(leaf).unwrap_or_default();
+                let not_after_str = leaf
+                    .not_after_ts
+                    .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "n/a".to_string());
                 println!("Leaf Subject : {}", leaf.subject);
                 println!("Leaf Issuer  : {}", leaf.issuer);
-                println!("Not After    : {:?}", leaf.not_after);
+                println!("Not After    : {}", not_after_str);
                 println!("Days to exp. : {}", days);
                 println!("SANs         : {:?}", leaf.san);
             } else {

@@ -1,8 +1,8 @@
 
-# omarchy-cert-tui (starter)
+# omarchy-cert-tui (starter, fixed)
 
 A Neovim-style, event-driven TUI/CLI starter to inspect remote TLS certificates and show expiry,
-built for Linux (works great in Omarchy). It **uses the system `openssl`** to grab the presented chain, then parses
+built for Linux (works in Omarchy). It **uses the system `openssl`** to grab the presented chain, then parses
 certificates locally.
 
 ## Features (MVP)
@@ -22,21 +22,17 @@ certificates locally.
 - Linux with:
   - Rust toolchain (`rustup`, `cargo`)
   - `openssl` CLI installed (e.g., `pacman -S openssl` or `apt-get install openssl`)
-- A UTF-8 terminal (xterm-compatible) for mouse support
 
 ## Build
 
 ```bash
-# from repo root
 cargo build
 ```
 
 ## Run (CLI)
 
 ```bash
-# Inspect remote endpoint
 cargo run -p omarchy-cert-cli -- inspect example.com:443
-# With explicit SNI (optional)
 cargo run -p omarchy-cert-cli -- inspect example.com:443 --sni example.com
 ```
 
@@ -53,17 +49,11 @@ cargo run -p omarchy-cert-tui
 ## Packaging
 
 ```bash
-# Release build (static-ish depending on your toolchain)
 cargo build --release
 ```
 
-Artifacts in `target/release/`:
-- `omarchy-cert-cli`
-- `omarchy-cert-tui`
+## Notes / Fixes
 
-## Notes
-
-- This starter shells out to `openssl s_client` for parity with real-world chains.
-  You can swap to native TLS libraries later.
-- Parsing uses `x509-parser` and `pem` crates.
-- The code is structured so the **core** crate remains UI-agnostic.
+- Validity timestamps are stored as **epoch seconds** to avoid `chrono` serde issues.
+- Added `sha2` dependency; using `pem::Pem::contents()` accessor.
+- Removed `FromBer` import; simplified X.509 parsing.
