@@ -11,11 +11,12 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use arboard::Clipboard;
 use chrono::{TimeZone, Utc};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
-        KeyModifiers,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -24,6 +25,7 @@ use omarchy_cert_core::{
     days_until_expiry, inspect_local_path, inspect_remote, CertInfo, LocalCertFormat,
     PasswordRequiredError, ProtectedStoreKind,
 };
+use ratatui::layout::Margin;
 use ratatui::{
     prelude::*,
     widgets::{
@@ -72,18 +74,29 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout)? {
-            if let CEvent::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
-                    if let Err(err) = app.persist_state() {
-                        app.set_status(format!("Failed to save history: {err}"));
-                        continue;
+            match event::read()? {
+                CEvent::Key(key) => {
+                    if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+                        if let Err(err) = app.persist_state() {
+                            app.set_status(format!("Failed to save history: {err}"));
+                            continue;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
 
-                if let Err(err) = handle_key(&mut app, key).await {
-                    app.set_status(format!("Error: {err}"));
+                    if let Err(err) = handle_key(&mut app, key).await {
+                        app.set_status(format!("Error: {err}"));
+                    }
                 }
+                CEvent::Mouse(mouse) => {
+                    if let Err(err) = handle_mouse(&mut app, mouse) {
+                        app.set_status(format!("Error: {err}"));
+                    }
+                }
+                CEvent::Resize(_, _)
+                | CEvent::FocusGained
+                | CEvent::FocusLost
+                | CEvent::Paste(_) => {}
             }
         }
 
@@ -124,6 +137,139 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         Focus::HistorySearch => handle_history_search_focus(app, key)?,
         Focus::Table => handle_table_focus(app, key).await?,
         Focus::TableSearch => handle_table_search_focus(app, key)?,
+    }
+
+    Ok(())
+}
+
+fn handle_mouse(app: &mut App, event: MouseEvent) -> Result<()> {
+    let x = event.column;
+    let y = event.row;
+
+    if app.cert_fullscreen_active() {
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.close_cert_fullscreen();
+        }
+        return Ok(());
+    }
+
+    if app.password_dialog_active() {
+        // Ignore mouse interactions while password dialog is active for now.
+        return Ok(());
+    }
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(area) = app.input_area {
+                if point_in_rect(area, x, y) {
+                    if !app.is_input_editing() {
+                        app.start_input_editing_with(false);
+                        app.set_status("Editing target: Enter submits, Esc cancels.");
+                    }
+                    app.focus = Focus::Input;
+                    return Ok(());
+                }
+            }
+
+            if let Some(view) = app.history_view.clone() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::History;
+                    let inner = view.area.inner(&Margin::new(1, 1));
+                    if inner.width > 0 && inner.height > 0 && point_in_rect(inner, x, y) {
+                        let row = y.saturating_sub(inner.y) as usize;
+                        let idx = view.offset.saturating_add(row);
+                        if idx < view.indices.len() {
+                            app.apply_selection(view.indices[idx]);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            if let Some(view) = app.table_view.clone() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::Table;
+                    let inner = view.area.inner(&Margin::new(1, 1));
+                    if inner.width > 0 && inner.height > 0 && point_in_rect(inner, x, y) {
+                        if y > inner.y {
+                            let row = y - inner.y - 1; // skip header row
+                            let idx = view.offset.saturating_add(row as usize);
+                            if idx < view.indices.len() {
+                                app.table_state.select(Some(idx));
+                                app.ensure_table_selection();
+                                app.open_cert_modal();
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            if let Some(area) = app.filter_area {
+                if point_in_rect(area, x, y) {
+                    match app.focus {
+                        Focus::History | Focus::HistorySearch => app.start_history_search(),
+                        Focus::Table | Focus::TableSearch => app.start_table_search(),
+                        Focus::Input => {
+                            if app.selected.is_some() {
+                                app.start_table_search();
+                            } else {
+                                app.start_history_search();
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            if let Some(area) = app.cert_pem_area {
+                if point_in_rect(area, x, y) {
+                    if let Some((_, _, cert)) = app.cert_modal_info() {
+                        match copy_pem_to_clipboard(&cert.pem) {
+                            Ok(_) => app.set_status("Certificate PEM copied to clipboard."),
+                            Err(err) => {
+                                app.set_status(format!("Failed to copy certificate PEM: {err}"))
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(view) = app.history_view.as_ref() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::History;
+                    app.move_selection(1);
+                    return Ok(());
+                }
+            }
+            if let Some(view) = app.table_view.as_ref() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::Table;
+                    app.move_table_selection(1);
+                    return Ok(());
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some(view) = app.history_view.as_ref() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::History;
+                    app.move_selection(-1);
+                    return Ok(());
+                }
+            }
+            if let Some(view) = app.table_view.as_ref() {
+                if point_in_rect(view.area, x, y) {
+                    app.focus = Focus::Table;
+                    app.move_table_selection(-1);
+                    return Ok(());
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(())
@@ -450,6 +596,11 @@ struct App {
     password_dialog: Option<PasswordDialog>,
     cert_modal: Option<CertModal>,
     cert_fullscreen: bool,
+    input_area: Option<Rect>,
+    history_view: Option<HistoryViewCache>,
+    table_view: Option<TableViewCache>,
+    filter_area: Option<Rect>,
+    cert_pem_area: Option<Rect>,
 }
 
 impl Default for App {
@@ -477,6 +628,11 @@ impl Default for App {
             password_dialog: None,
             cert_modal: None,
             cert_fullscreen: false,
+            input_area: None,
+            history_view: None,
+            table_view: None,
+            filter_area: None,
+            cert_pem_area: None,
         }
     }
 }
@@ -511,6 +667,40 @@ struct PasswordDialog {
     input: String,
 }
 
+#[derive(Clone)]
+struct HistoryViewCache {
+    area: Rect,
+    indices: Vec<usize>,
+    offset: usize,
+}
+
+impl Default for HistoryViewCache {
+    fn default() -> Self {
+        Self {
+            area: Rect::new(0, 0, 0, 0),
+            indices: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TableViewCache {
+    area: Rect,
+    indices: Vec<usize>,
+    offset: usize,
+}
+
+impl Default for TableViewCache {
+    fn default() -> Self {
+        Self {
+            area: Rect::new(0, 0, 0, 0),
+            indices: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
 impl App {
     fn set_status<S: Into<String>>(&mut self, s: S) {
         self.status = s.into();
@@ -520,7 +710,10 @@ impl App {
         self.input_edit_mode
     }
 
-    fn start_input_editing(&mut self) {
+    fn start_input_editing_with(&mut self, clear: bool) {
+        if clear {
+            self.input.clear();
+        }
         self.input_edit_mode = true;
         self.focus = Focus::Input;
     }
@@ -783,6 +976,10 @@ impl App {
         self.cert_fullscreen
     }
 
+    fn filter_active(&self) -> bool {
+        matches!(self.focus, Focus::HistorySearch | Focus::TableSearch)
+    }
+
     fn filtered_cert_indices_current(&self) -> Vec<usize> {
         let Some(entry_idx) = self.selected else {
             return Vec::new();
@@ -876,6 +1073,7 @@ impl App {
     fn close_cert_modal(&mut self) {
         self.cert_modal = None;
         self.cert_fullscreen = false;
+        self.cert_pem_area = None;
     }
 
     fn open_cert_fullscreen(&mut self) {
@@ -1175,6 +1373,18 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
 
     if key.modifiers.is_empty() {
         if let KeyCode::Char(c) = key.code {
+            if c.eq_ignore_ascii_case(&'e') {
+                if !app.is_input_editing() && !app.filter_active() {
+                    app.start_input_editing_with(false);
+                    app.set_status("Editing target: Enter submits, Esc cancels.");
+                    return Ok(true);
+                }
+            }
+
+            if app.filter_active() {
+                return Ok(false);
+            }
+
             let target_focus = match c.to_ascii_lowercase() {
                 't' => Some(Focus::Input),
                 'h' => Some(Focus::History),
@@ -1233,7 +1443,7 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
     if !app.is_input_editing() {
         match key.code {
             KeyCode::Enter => {
-                app.start_input_editing();
+                app.start_input_editing_with(true);
                 app.set_status("Editing target: Enter submits, Esc cancels.");
             }
             KeyCode::Esc => {
@@ -2120,6 +2330,8 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     render_status_panel(f, app, layout[3]);
     render_shortcuts(f, app, layout[4]);
 
+    app.cert_pem_area = None;
+
     if app.find_dialog_active() {
         render_find_dialog(f, app);
     }
@@ -2149,7 +2361,8 @@ fn label_span(label: &str, theme: &Theme) -> Span<'static> {
     Span::styled(format!("{label}: "), Style::default().fg(theme.muted))
 }
 
-fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_input(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.input_area = Some(area);
     let label = if app.is_input_editing() {
         "target (editing — host:port or path)"
     } else {
@@ -2165,6 +2378,8 @@ fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.history_view = None;
+    app.table_view = None;
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -2189,6 +2404,11 @@ fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     let visible_indices = app.visible_indices();
+    app.history_view = Some(HistoryViewCache {
+        area,
+        indices: visible_indices.clone(),
+        offset: app.history_state.offset(),
+    });
     if visible_indices.is_empty() {
         let empty = Paragraph::new("No entries yet").block(block);
         f.render_widget(empty, area);
@@ -2289,11 +2509,13 @@ fn history_line(entry: &TargetEntry, theme: &Theme) -> Line<'static> {
 fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.ensure_table_selection();
 
+    let mut view_indices: Vec<usize> = Vec::new();
     let (rows, total, filtered) = if let Some(entry_idx) = app.selected {
         let entry = &app.entries[entry_idx];
         let indices = app.filtered_cert_indices(entry);
         let total = entry.certs.len();
         let filtered = indices.len();
+        view_indices = indices.clone();
         let rows: Vec<Row> = indices
             .into_iter()
             .map(|idx| {
@@ -2325,6 +2547,12 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         (Vec::new(), 0, 0)
     };
+
+    app.table_view = Some(TableViewCache {
+        area,
+        indices: view_indices,
+        offset: app.table_state.offset(),
+    });
 
     let table_label = if let Some(entry) = app.current_entry() {
         let mut base = format!(
@@ -2377,7 +2605,8 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn render_filter_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_filter_bar(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.filter_area = Some(area);
     let (title, line, highlight) = match app.focus {
         Focus::History | Focus::HistorySearch => (
             section_title('/', "filter — history", &app.theme),
@@ -2640,7 +2869,7 @@ fn render_find_dialog(f: &mut Frame<'_>, app: &App) {
     f.render_widget(input, chunks[2]);
 }
 
-fn render_cert_modal(f: &mut Frame<'_>, app: &App) {
+fn render_cert_modal(f: &mut Frame<'_>, app: &mut App) {
     let Some((entry, idx, cert)) = app.cert_modal_info() else {
         return;
     };
@@ -2741,6 +2970,7 @@ fn render_cert_modal(f: &mut Frame<'_>, app: &App) {
         .wrap(Wrap { trim: false })
         .block(pem_block);
     f.render_widget(pem, layout[1]);
+    app.cert_pem_area = Some(layout[1]);
 }
 
 fn render_cert_fullscreen(f: &mut Frame<'_>, app: &App) {
@@ -2812,6 +3042,21 @@ fn render_cert_fullscreen(f: &mut Frame<'_>, app: &App) {
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
+}
+
+fn copy_pem_to_clipboard(pem: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("clipboard unavailable")?;
+    clipboard
+        .set_text(pem.to_string())
+        .context("failed to copy PEM to clipboard")?;
+    Ok(())
+}
+
+fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }
 
 fn centered_rect(width: u16, height: u16, container: Rect) -> Rect {
