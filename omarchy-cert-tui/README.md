@@ -6,7 +6,7 @@ Interactive terminal user interface (TUI) and supporting crates for discovering,
 |-------|---------|
 | `omarchy-cert-core` | Blocking/async helpers for fetching remote certificates, parsing local stores (PEM, PKCS#7, PKCS#12, Java keystores/truststores) and discovering files. |
 | `omarchy-cert-cli`  | Minimal CLI wrapper around the core crate. Handy for quick scripting or piping JSON. |
-| `omarchy-cert-tui`  | Full-screen TUI built with `ratatui`/`crossterm`, featuring history, filtering, password prompts for protected stores, and mouse support. |
+| `omarchy-cert-tui` (binary `cerTUI`) | Full-screen TUI built with `ratatui`/`crossterm`, featuring history, filtering, password prompts for protected stores, and mouse support. |
 
 ---
 
@@ -31,7 +31,7 @@ cargo build
 ## Running the TUI
 
 ```bash
-cargo run -p omarchy-cert-tui
+cargo run --bin cerTUI
 ```
 
 ### Layout Overview
@@ -176,7 +176,7 @@ cargo run -p omarchy-cert-cli -- inspect-json example.com:443
 
 ```bash
 cargo install --path crates/tui --locked
-# Binary ends up in ~/.cargo/bin/omarchy-cert-tui
+# Binary ends up in ~/.cargo/bin/cerTUI
 ```
 
 ### Add an Omarchy Launcher Entry
@@ -187,7 +187,7 @@ cargo install --path crates/tui --locked
    [Desktop Entry]
    Name=Certificate Inspector (TUI)
    Comment=Inspect local and remote certificates
-   Exec=/home/<user>/.cargo/bin/omarchy-cert-tui
+   Exec=/home/<user>/.cargo/bin/cerTUI
    Type=Application
    Terminal=true
    Categories=Utility;Security;
@@ -200,7 +200,7 @@ cargo install --path crates/tui --locked
 1. Open Omarchy Settings → Keyboard → Shortcuts.
 2. Add a custom shortcut:
    * Name: `Certificate Inspector`
-   * Command: `/home/<user>/.cargo/bin/omarchy-cert-tui`
+   * Command: `/home/<user>/.cargo/bin/cerTUI`
    * Binding: e.g. `Super+Shift+C`
 3. Apply changes.
 
@@ -270,4 +270,3 @@ For SSH pushes ensure you have an SSH key registered in GitHub (`Settings → SS
 * **Keystore parsing** – Ensure `keytool` is installed and that the keystore is readable by the current user.
 
 Happy certificate hunting!
-
