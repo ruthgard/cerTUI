@@ -219,50 +219,6 @@ cargo install --path crates/tui --locked
 
 ---
 
-## Preparing a GitHub Repository
-
-1. **Register or reset GitHub password**
-   * New account:
-     1. Visit <https://github.com/signup>.
-     2. Enter email, pick a username & password, verify email, complete onboarding.
-   * Forgot password:
-     1. Visit <https://github.com/password_reset>.
-     2. Provide your email/username, follow the emailed link to set a new password.
-
-2. **Initialise the local repo (if not already)**
-
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit: certificate TUI"
-   ```
-
-3. **Create a GitHub repository**
-   * Go to <https://github.com/new>.
-   * Choose owner, repository name (`omarchy-cert-tui` recommended), keep it empty (no README).
-   * Click “Create repository”.
-
-4. **Connect and push**
-
-   ```bash
-   git remote add origin git@github.com:<user>/omarchy-cert-tui.git
-   # or https://github.com/<user>/omarchy-cert-tui.git
-   git branch -M main
-   git push -u origin main
-   ```
-
-5. **Subsequent updates**
-
-   ```bash
-   git add .
-   git commit -m "Describe changes"
-   git push
-   ```
-
-For SSH pushes ensure you have an SSH key registered in GitHub (`Settings → SSH and GPG keys`). For HTTPS pushes, GitHub requires a personal access token instead of a password – generate one at <https://github.com/settings/tokens>.
-
----
-
 ## Troubleshooting
 
 * **Clipboard errors** – Ensure your environment provides clipboard access (Wayland sessions may require `wl-copy`/`wl-paste`; alternatively disable mouse Copy).
