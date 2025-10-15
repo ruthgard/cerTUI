@@ -1,7 +1,12 @@
 use std::{
     cmp::Ordering,
-    env, fs, io,
-    path::PathBuf,
+    collections::HashSet,
+    env,
+    ffi::OsStr,
+    fs, io,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -15,10 +20,16 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use omarchy_cert_core::{days_until_expiry, inspect_local_path, inspect_remote, CertInfo};
+use omarchy_cert_core::{
+    days_until_expiry, inspect_local_path, inspect_remote, CertInfo, LocalCertFormat,
+    PasswordRequiredError, ProtectedStoreKind,
+};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Wrap,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,6 +94,26 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if app.find_dialog_active() {
+        handle_find_dialog(app, key).await?;
+        return Ok(());
+    }
+
+    if app.password_dialog_active() {
+        handle_password_dialog(app, key).await?;
+        return Ok(());
+    }
+
+    if app.cert_fullscreen_active() {
+        handle_cert_fullscreen(app, key)?;
+        return Ok(());
+    }
+
+    if app.cert_modal_active() {
+        handle_cert_modal(app, key)?;
+        return Ok(());
+    }
+
     if handle_global_keys(app, &key).await? {
         return Ok(());
     }
@@ -100,7 +131,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 fn initialize_app() -> App {
     let mut app = App::default();
-    let default_status = "Type host[:port] (443 default) or path, Enter to inspect. Tab cycles focus / autocompletes paths. / filters the focused list. Ctrl+R refreshes selection. Ctrl+L clears history. q quits.";
+    let default_status = "Press Enter to edit the target (Enter submits, Esc cancels). Ctrl+F opens the find dialog to scan for certificates. T/H/C focus Target/History/Certificates. Tab cycles focus when not editing; Tab autocompletes paths when editing. / filters the focused list. Ctrl+R refreshes selection. Ctrl+L clears history. Delete/x remove history entries. q quits.";
     app.set_status(default_status);
 
     let (settings, settings_msg) = match Settings::load() {
@@ -241,13 +272,6 @@ impl TargetKind {
         }
     }
 
-    fn icon(&self) -> &'static str {
-        match self {
-            TargetKind::Remote { .. } => "", // Nerd Font globe
-            TargetKind::Local { .. } => "",  // Nerd Font folder
-        }
-    }
-
     fn color(&self, theme: &Theme) -> Color {
         match self {
             TargetKind::Remote { .. } => theme.remote,
@@ -262,16 +286,31 @@ struct TargetEntry {
     kind: TargetKind,
     certs: Vec<CertInfo>,
     status: String,
+    #[serde(default)]
+    local_format: Option<LocalCertFormat>,
+    #[serde(default)]
+    local_is_dir: Option<bool>,
+    #[serde(skip)]
+    protected: Option<ProtectedState>,
 }
 
 impl TargetEntry {
-    fn new(kind: TargetKind, certs: Vec<CertInfo>, status: String) -> Self {
+    fn new(
+        kind: TargetKind,
+        certs: Vec<CertInfo>,
+        local_format: Option<LocalCertFormat>,
+        local_is_dir: Option<bool>,
+        status: String,
+    ) -> Self {
         let label = kind.label();
         Self {
             label,
             kind,
             certs,
             status,
+            local_format,
+            local_is_dir,
+            protected: None,
         }
     }
 
@@ -392,6 +431,7 @@ struct App {
     input: String,
     status: String,
     focus: Focus,
+    input_edit_mode: bool,
     entries: Vec<TargetEntry>,
     selected: Option<usize>,
     history_filter: Option<String>,
@@ -402,8 +442,14 @@ struct App {
     sort_order: SortOrder,
     dirty: bool,
     history_state: ListState,
+    table_state: TableState,
     settings: Settings,
     theme: Theme,
+    find_dialog: Option<FindDialog>,
+    last_find_root: Option<PathBuf>,
+    password_dialog: Option<PasswordDialog>,
+    cert_modal: Option<CertModal>,
+    cert_fullscreen: bool,
 }
 
 impl Default for App {
@@ -412,6 +458,7 @@ impl Default for App {
             input: String::new(),
             status: String::new(),
             focus: Focus::Input,
+            input_edit_mode: true,
             entries: Vec::new(),
             selected: None,
             history_filter: None,
@@ -422,15 +469,101 @@ impl Default for App {
             sort_order: SortOrder::Asc,
             dirty: false,
             history_state: ListState::default(),
+            table_state: TableState::default(),
             settings: Settings::default(),
             theme: Theme::default(),
+            find_dialog: None,
+            last_find_root: None,
+            password_dialog: None,
+            cert_modal: None,
+            cert_fullscreen: false,
         }
     }
+}
+
+#[derive(Clone)]
+struct FindDialog {
+    input: String,
+}
+
+#[derive(Clone)]
+struct CertModal {
+    entry_index: usize,
+    cert_index: usize,
+}
+
+#[derive(Clone)]
+struct ProtectedState {
+    kind: ProtectedStoreKind,
+    last_error: Option<String>,
+}
+
+impl ProtectedState {
+    fn new(kind: ProtectedStoreKind, last_error: Option<String>) -> Self {
+        Self { kind, last_error }
+    }
+}
+
+#[derive(Clone)]
+struct PasswordDialog {
+    entry_index: usize,
+    kind: ProtectedStoreKind,
+    input: String,
 }
 
 impl App {
     fn set_status<S: Into<String>>(&mut self, s: S) {
         self.status = s.into();
+    }
+
+    fn is_input_editing(&self) -> bool {
+        self.input_edit_mode
+    }
+
+    fn start_input_editing(&mut self) {
+        self.input_edit_mode = true;
+        self.focus = Focus::Input;
+    }
+
+    fn stop_input_editing(&mut self) {
+        self.input_edit_mode = false;
+    }
+
+    fn restore_selected_input(&mut self) {
+        if let Some(idx) = self.selected {
+            if let Some(entry) = self.entries.get(idx) {
+                self.input = entry.label.clone();
+                return;
+            }
+        }
+        self.input.clear();
+    }
+
+    fn default_find_root(&self) -> PathBuf {
+        if let Some(path) = &self.last_find_root {
+            return path.clone();
+        }
+        env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"))
+    }
+
+    fn open_find_dialog(&mut self) {
+        let default_root = self.default_find_root();
+        self.find_dialog = Some(FindDialog {
+            input: default_root.display().to_string(),
+        });
+        self.set_status(
+            "Find certificates: Enter to confirm, Esc to cancel, Tab autocompletes paths.",
+        );
+    }
+
+    fn close_find_dialog(&mut self) {
+        self.find_dialog = None;
+    }
+
+    fn find_dialog_active(&self) -> bool {
+        self.find_dialog.is_some()
     }
 
     fn mark_dirty(&mut self) {
@@ -454,6 +587,12 @@ impl App {
         self.table_filter = None;
         self.table_search_buffer.clear();
         self.history_state.select(None);
+        self.table_state.select(None);
+        self.cert_modal = None;
+        self.cert_fullscreen = false;
+        self.password_dialog = None;
+        self.input.clear();
+        self.input_edit_mode = true;
         self.mark_dirty();
     }
 
@@ -477,7 +616,9 @@ impl App {
             self.input = entry.label.clone();
             self.status = entry.status.clone();
         }
+        self.stop_input_editing();
         self.sync_history_state();
+        self.reset_table_selection();
     }
 
     fn select_actual(&mut self, actual_idx: usize) {
@@ -518,6 +659,21 @@ impl App {
         self.apply_selection(next_actual);
     }
 
+    fn remove_selected_entry(&mut self) -> Option<TargetEntry> {
+        let idx = self.selected?;
+        let entry = self.entries.remove(idx);
+        self.selected = None;
+        self.history_state.select(None);
+        if self.entries.is_empty() {
+            self.input.clear();
+            self.input_edit_mode = true;
+        } else {
+            self.ensure_selection();
+        }
+        self.mark_dirty();
+        Some(entry)
+    }
+
     fn ensure_selection(&mut self) {
         let visible = self.visible_indices();
         if visible.is_empty() {
@@ -545,6 +701,209 @@ impl App {
 
     fn current_kind(&self) -> Option<&TargetKind> {
         self.current_entry().map(|entry| &entry.kind)
+    }
+
+    fn password_dialog_active(&self) -> bool {
+        self.password_dialog.is_some()
+    }
+
+    fn open_password_dialog(&mut self, entry_index: usize, kind: ProtectedStoreKind) {
+        self.password_dialog = Some(PasswordDialog {
+            entry_index,
+            kind,
+            input: String::new(),
+        });
+        self.set_status(format!(
+            "{} locked — enter password (Enter submits, Esc cancels).",
+            self.entries
+                .get(entry_index)
+                .map(|entry| entry.title())
+                .unwrap_or_default()
+        ));
+    }
+
+    fn close_password_dialog(&mut self) {
+        self.password_dialog = None;
+    }
+
+    fn entry_protected(&self, idx: usize) -> Option<&ProtectedState> {
+        self.entries
+            .get(idx)
+            .and_then(|entry| entry.protected.as_ref())
+    }
+
+    fn set_entry_protected(
+        &mut self,
+        idx: usize,
+        state: ProtectedState,
+        local_format: Option<LocalCertFormat>,
+        local_is_dir: Option<bool>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(idx) {
+            entry.protected = Some(state);
+            entry.certs.clear();
+            if let Some(format) = local_format {
+                entry.local_format = Some(format);
+            }
+            if let Some(is_dir) = local_is_dir {
+                entry.local_is_dir = Some(is_dir);
+            }
+            if Some(idx) == self.selected {
+                self.reset_table_selection();
+            }
+            self.mark_dirty();
+        }
+    }
+
+    fn update_entry_certs(
+        &mut self,
+        idx: usize,
+        kind: TargetKind,
+        loaded: LoadedCerts,
+        status: String,
+    ) {
+        if let Some(entry) = self.entries.get_mut(idx) {
+            entry.certs = loaded.certs;
+            entry.status = status;
+            entry.protected = None;
+            entry.label = kind.label();
+            entry.local_format = loaded.local_format;
+            entry.local_is_dir = loaded.local_is_dir;
+        }
+        self.mark_dirty();
+        self.table_state.select(None);
+        self.ensure_table_selection();
+    }
+
+    fn cert_modal_active(&self) -> bool {
+        self.cert_modal.is_some()
+    }
+
+    fn cert_fullscreen_active(&self) -> bool {
+        self.cert_fullscreen
+    }
+
+    fn filtered_cert_indices_current(&self) -> Vec<usize> {
+        let Some(entry_idx) = self.selected else {
+            return Vec::new();
+        };
+        let entry = &self.entries[entry_idx];
+        self.filtered_cert_indices(entry)
+    }
+
+    fn ensure_table_selection(&mut self) {
+        let indices = self.filtered_cert_indices_current();
+        if indices.is_empty() {
+            self.table_state.select(None);
+            self.cert_modal = None;
+            self.cert_fullscreen = false;
+            return;
+        }
+        let current = self
+            .table_state
+            .selected()
+            .unwrap_or(0)
+            .min(indices.len() - 1);
+        self.table_state.select(Some(current));
+        if let Some(modal) = self.cert_modal.as_ref() {
+            if Some(modal.entry_index) != self.selected || !indices.contains(&modal.cert_index) {
+                self.cert_modal = None;
+                self.cert_fullscreen = false;
+            }
+        }
+    }
+
+    fn reset_table_selection(&mut self) {
+        self.table_state.select(None);
+        self.cert_modal = None;
+        self.cert_fullscreen = false;
+        self.ensure_table_selection();
+    }
+
+    fn move_table_selection(&mut self, delta: isize) {
+        let indices = self.filtered_cert_indices_current();
+        if indices.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let current = self
+            .table_state
+            .selected()
+            .unwrap_or(0)
+            .min(indices.len() - 1);
+        let max_pos = indices.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, max_pos) as usize;
+        self.table_state.select(Some(next));
+    }
+
+    fn current_cert_index(&self) -> Option<usize> {
+        let indices = self.filtered_cert_indices_current();
+        let selected = self.table_state.selected()?;
+        indices.get(selected).copied()
+    }
+
+    fn open_cert_modal(&mut self) {
+        if let Some(entry_idx) = self.selected {
+            if let Some(state) = self.entry_protected(entry_idx).cloned() {
+                self.cert_modal = None;
+                self.cert_fullscreen = false;
+                self.open_password_dialog(entry_idx, state.kind);
+                return;
+            }
+        }
+        if let (Some(entry_idx), Some(cert_idx)) = (self.selected, self.current_cert_index()) {
+            let candidate = CertModal {
+                entry_index: entry_idx,
+                cert_index: cert_idx,
+            };
+            let needs_status = match self.cert_modal.as_ref() {
+                Some(current)
+                    if current.entry_index == candidate.entry_index
+                        && current.cert_index == candidate.cert_index =>
+                {
+                    false
+                }
+                _ => true,
+            };
+            self.cert_modal = Some(candidate);
+            self.cert_fullscreen = false;
+            if needs_status {
+                self.set_status("Certificate details shown. Esc to close.");
+            }
+        }
+    }
+
+    fn close_cert_modal(&mut self) {
+        self.cert_modal = None;
+        self.cert_fullscreen = false;
+    }
+
+    fn open_cert_fullscreen(&mut self) {
+        if self.cert_modal.is_some() {
+            if !self.cert_fullscreen {
+                self.cert_fullscreen = true;
+                self.set_status("Certificate fullscreen view. Press any key to exit.");
+            }
+        }
+    }
+
+    fn close_cert_fullscreen(&mut self) {
+        if self.cert_fullscreen {
+            self.cert_fullscreen = false;
+            if self.cert_modal.is_some() {
+                self.set_status("Certificate details shown. Esc to close.");
+            }
+        }
+    }
+
+    fn cert_modal_info(&self) -> Option<(&TargetEntry, usize, &CertInfo)> {
+        let modal = self.cert_modal.as_ref()?;
+        if Some(modal.entry_index) != self.selected {
+            return None;
+        }
+        let entry = self.entries.get(modal.entry_index)?;
+        let cert = entry.certs.get(modal.cert_index)?;
+        Some((entry, modal.cert_index, cert))
     }
 
     fn start_history_search(&mut self) {
@@ -589,10 +948,12 @@ impl App {
         } else {
             self.table_filter = Some(trimmed);
         }
+        self.ensure_table_selection();
     }
 
     fn finish_table_search(&mut self) {
         self.focus = Focus::Table;
+        self.ensure_table_selection();
     }
 
     fn cancel_table_search(&mut self) {
@@ -600,6 +961,7 @@ impl App {
         self.table_filter = None;
         self.focus = Focus::Table;
         self.set_status("Certificate filter cleared.");
+        self.reset_table_selection();
     }
 
     fn set_sort(&mut self, key: SortKey) {
@@ -607,6 +969,7 @@ impl App {
             self.sort_key = SortKey::Chain;
             self.sort_order = SortOrder::Asc;
             self.set_status("Sorting by chain order.");
+            self.ensure_table_selection();
             return;
         }
         if self.sort_key == key {
@@ -620,6 +983,7 @@ impl App {
             self.sort_key.label(),
             self.sort_order.label()
         ));
+        self.ensure_table_selection();
     }
 
     fn filtered_cert_indices(&self, entry: &TargetEntry) -> Vec<usize> {
@@ -725,6 +1089,11 @@ fn cert_matches_filter(cert: &CertInfo, needle: &str) -> bool {
 }
 
 async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
+    let input_editing = matches!(app.focus, Focus::Input) && app.is_input_editing();
+    if input_editing {
+        return Ok(false);
+    }
+
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.clear_entries();
         app.set_status("History cleared.");
@@ -737,10 +1106,16 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
     if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if let Some(kind) = app.current_kind().cloned() {
             app.set_status(kind.loading_message());
-            match load_certs_for(kind.clone(), app.settings.timeout_secs).await {
-                Ok(certs) => {
-                    let status_message = describe_fetch(&kind, &certs);
-                    let entry = TargetEntry::new(kind, certs, status_message.clone());
+            match load_certs_for(kind.clone(), app.settings.timeout_secs, None).await {
+                Ok(loaded) => {
+                    let status_message = describe_fetch(&kind, &loaded.certs);
+                    let entry = TargetEntry::new(
+                        kind,
+                        loaded.certs,
+                        loaded.local_format,
+                        loaded.local_is_dir,
+                        status_message.clone(),
+                    );
                     app.upsert_entry(entry);
                     if let Err(err) = app.persist_state() {
                         app.set_status(format!("{status_message} (failed to save: {err})"));
@@ -748,10 +1123,92 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
                         app.set_status(status_message);
                     }
                 }
-                Err(err) => app.set_status(format!("Error: {err}")),
+                Err(err) => {
+                    if let (TargetKind::Local { path }, Some(password_err)) =
+                        (&kind, err.downcast_ref::<PasswordRequiredError>())
+                    {
+                        let (status_message, local_format) =
+                            password_required_feedback(&kind, password_err);
+                        if let Some(idx) = app.selected {
+                            app.set_entry_protected(
+                                idx,
+                                ProtectedState::new(
+                                    password_err.kind(),
+                                    password_err.last_error().map(|s| s.to_string()),
+                                ),
+                                local_format,
+                                Some(path.is_dir()),
+                            );
+                            if let Some(entry) = app.entries.get_mut(idx) {
+                                entry.status = status_message.clone();
+                            }
+                        } else {
+                            let mut entry = TargetEntry::new(
+                                kind.clone(),
+                                Vec::new(),
+                                local_format,
+                                Some(path.is_dir()),
+                                status_message.clone(),
+                            );
+                            entry.protected = Some(ProtectedState::new(
+                                password_err.kind(),
+                                password_err.last_error().map(|s| s.to_string()),
+                            ));
+                            app.upsert_entry(entry);
+                        }
+                        app.set_status(status_message);
+                    } else {
+                        app.set_status(format!("Error: {err}"));
+                    }
+                }
             }
         }
         return Ok(true);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+    {
+        app.open_find_dialog();
+        return Ok(true);
+    }
+
+    if key.modifiers.is_empty() {
+        if let KeyCode::Char(c) = key.code {
+            let target_focus = match c.to_ascii_lowercase() {
+                't' => Some(Focus::Input),
+                'h' => Some(Focus::History),
+                'c' => Some(Focus::Table),
+                _ => None,
+            };
+
+            if let Some(target) = target_focus {
+                let in_text_mode = matches!(app.focus, Focus::HistorySearch | Focus::TableSearch);
+                if in_text_mode && !matches!(target, Focus::Input) {
+                    return Ok(false);
+                }
+                let previous_focus = app.focus;
+                focus_section(app, target);
+                if previous_focus == target && matches!(target, Focus::Input) {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+
+            if c == '/' {
+                match app.focus {
+                    Focus::History | Focus::HistorySearch => {
+                        app.start_history_search();
+                        return Ok(true);
+                    }
+                    Focus::Table | Focus::TableSearch => {
+                        app.start_table_search();
+                        return Ok(true);
+                    }
+                    Focus::Input => {}
+                }
+            }
+        }
     }
 
     if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -765,66 +1222,103 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
     }
 
     if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        if matches!(app.focus, Focus::Input) && try_autocomplete_input(app) {
-            return Ok(true);
-        }
         focus_next(app);
         return Ok(true);
-    }
-
-    if key.code == KeyCode::Char('/') && key.modifiers.is_empty() {
-        match app.focus {
-            Focus::History | Focus::HistorySearch => {
-                app.start_history_search();
-                return Ok(true);
-            }
-            Focus::Table | Focus::TableSearch => {
-                app.start_table_search();
-                return Ok(true);
-            }
-            Focus::Input => {}
-        }
     }
 
     Ok(false)
 }
 
 async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
+    if !app.is_input_editing() {
+        match key.code {
+            KeyCode::Enter => {
+                app.start_input_editing();
+                app.set_status("Editing target: Enter submits, Esc cancels.");
+            }
+            KeyCode::Esc => {
+                app.restore_selected_input();
+                app.set_status("Target editing cancelled.");
+            }
+            KeyCode::Up => focus_prev(app),
+            KeyCode::Down => focus_next(app),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Enter => {
             let trimmed = app.input.trim();
             if trimmed.is_empty() {
+                app.stop_input_editing();
                 return Ok(());
             }
             let kind = match parse_target(trimmed) {
                 Ok(kind) => kind,
                 Err(err) => {
                     app.set_status(format!("Error: {err}"));
+                    app.stop_input_editing();
                     return Ok(());
                 }
             };
             app.set_status(kind.loading_message());
-            let certs = match load_certs_for(kind.clone(), app.settings.timeout_secs).await {
-                Ok(certs) => certs,
+            let loaded = match load_certs_for(kind.clone(), app.settings.timeout_secs, None).await {
+                Ok(loaded) => loaded,
                 Err(err) => {
-                    app.set_status(format!("Error: {err}"));
+                    if let (TargetKind::Local { path }, Some(password_err)) =
+                        (&kind, err.downcast_ref::<PasswordRequiredError>())
+                    {
+                        let (status_message, local_format) =
+                            password_required_feedback(&kind, password_err);
+                        let mut entry = TargetEntry::new(
+                            kind.clone(),
+                            Vec::new(),
+                            local_format,
+                            Some(path.is_dir()),
+                            status_message.clone(),
+                        );
+                        entry.protected = Some(ProtectedState::new(
+                            password_err.kind(),
+                            password_err.last_error().map(|s| s.to_string()),
+                        ));
+                        app.upsert_entry(entry);
+                        app.set_status(status_message);
+                    } else {
+                        app.set_status(format!("Error: {err}"));
+                    }
+                    app.stop_input_editing();
                     return Ok(());
                 }
             };
-            let status_message = describe_fetch(&kind, &certs);
-            let entry = TargetEntry::new(kind, certs, status_message.clone());
+            let status_message = describe_fetch(&kind, &loaded.certs);
+            let entry = TargetEntry::new(
+                kind.clone(),
+                loaded.certs,
+                loaded.local_format,
+                loaded.local_is_dir,
+                status_message.clone(),
+            );
             app.upsert_entry(entry);
             if let Err(err) = app.persist_state() {
                 app.set_status(format!("{status_message} (failed to save: {err})"));
             } else {
                 app.set_status(status_message);
             }
+            app.stop_input_editing();
         }
         KeyCode::Backspace => {
             app.input.pop();
         }
         KeyCode::Esc => {
-            app.input.clear();
+            app.restore_selected_input();
+            app.stop_input_editing();
+            app.set_status("Target editing cancelled.");
+        }
+        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if try_autocomplete_input(app) {
+                return Ok(());
+            }
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -832,12 +1326,6 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
             {
                 app.input.push(c);
             }
-        }
-        KeyCode::Up => {
-            focus_prev(app);
-        }
-        KeyCode::Down => {
-            focus_next(app);
         }
         _ => {}
     }
@@ -849,9 +1337,18 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::Enter => {
-            app.focus = Focus::Input;
+            focus_section(app, Focus::Input);
         }
-        KeyCode::Esc => app.focus = Focus::Input,
+        KeyCode::Esc => focus_section(app, Focus::Input),
+        KeyCode::Delete => {
+            if let Some(entry) = app.remove_selected_entry() {
+                let label = entry.kind.label();
+                app.set_status(format!("Removed {label} from history."));
+                if let Err(err) = app.persist_state() {
+                    app.set_status(format!("Removed {label} but failed to save: {err}"));
+                }
+            }
+        }
         KeyCode::Char(c) => {
             let command = c.to_ascii_lowercase();
             match command {
@@ -860,6 +1357,15 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 'n' => app.set_sort(SortKey::NotAfter),
                 'd' => app.set_sort(SortKey::DaysLeft),
                 'o' => app.set_sort(SortKey::Chain),
+                'x' => {
+                    if let Some(entry) = app.remove_selected_entry() {
+                        let label = entry.kind.label();
+                        app.set_status(format!("Removed {label} from history."));
+                        if let Err(err) = app.persist_state() {
+                            app.set_status(format!("Removed {label} but failed to save: {err}"));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -894,6 +1400,146 @@ fn handle_history_search_focus(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+async fn handle_password_dialog(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(dialog) = app.password_dialog.as_mut() {
+                dialog.input.clear();
+            }
+            app.close_password_dialog();
+            app.set_status("Password prompt cancelled.");
+        }
+        KeyCode::Backspace => {
+            if let Some(dialog) = app.password_dialog.as_mut() {
+                dialog.input.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                if let Some(dialog) = app.password_dialog.as_mut() {
+                    dialog.input.push(c);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let (entry_index, entry_kind, entry_title, password) =
+                match app.password_dialog.as_ref() {
+                    Some(dialog) => {
+                        let password = dialog.input.clone();
+                        match app.entries.get(dialog.entry_index) {
+                            Some(entry) => (
+                                dialog.entry_index,
+                                entry.kind.clone(),
+                                entry.title(),
+                                password,
+                            ),
+                            None => {
+                                app.close_password_dialog();
+                                app.set_status("Entry no longer available.");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => return Ok(()),
+                };
+
+            app.set_status(format!("Unlocking {entry_title} ..."));
+            let certs_result = load_certs_for(
+                entry_kind.clone(),
+                app.settings.timeout_secs,
+                Some(password.clone()),
+            )
+            .await;
+
+            if let Some(dialog) = app.password_dialog.as_mut() {
+                dialog.input.clear();
+            }
+            drop(password);
+
+            match certs_result {
+                Ok(loaded) => {
+                    let status_message = describe_fetch(&entry_kind, &loaded.certs);
+                    app.update_entry_certs(
+                        entry_index,
+                        entry_kind.clone(),
+                        loaded,
+                        status_message.clone(),
+                    );
+                    app.close_password_dialog();
+                    app.select_actual(entry_index);
+                    if let Err(err) = app.persist_state() {
+                        app.set_status(format!("{status_message} (failed to save: {err})"));
+                    } else {
+                        app.set_status(status_message.clone());
+                    }
+                    app.open_cert_modal();
+                }
+                Err(err) => {
+                    if let Some(password_err) = err.downcast_ref::<PasswordRequiredError>() {
+                        let (status_message, local_format) =
+                            password_required_feedback(&entry_kind, password_err);
+                        app.set_entry_protected(
+                            entry_index,
+                            ProtectedState::new(
+                                password_err.kind(),
+                                password_err.last_error().map(|s| s.to_string()),
+                            ),
+                            local_format,
+                            match &entry_kind {
+                                TargetKind::Local { path } => Some(path.is_dir()),
+                                _ => None,
+                            },
+                        );
+                        if let Some(entry) = app.entries.get_mut(entry_index) {
+                            entry.status = status_message.clone();
+                        }
+                        app.set_status(status_message);
+                    } else {
+                        app.close_password_dialog();
+                        app.set_status(format!("Error: {err}"));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn handle_cert_modal(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_cert_modal();
+        }
+        KeyCode::Enter => {
+            app.close_cert_modal();
+        }
+        KeyCode::Up => {
+            app.move_table_selection(-1);
+            app.open_cert_modal();
+        }
+        KeyCode::Down => {
+            app.move_table_selection(1);
+            app.open_cert_modal();
+        }
+        KeyCode::Char(c) => {
+            if matches!(c, 'f' | 'F') {
+                app.open_cert_fullscreen();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_cert_fullscreen(app: &mut App, _key: KeyEvent) -> Result<()> {
+    app.close_cert_fullscreen();
+    Ok(())
+}
+
 async fn handle_table_focus(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char(c) => {
@@ -908,8 +1554,11 @@ async fn handle_table_focus(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Esc => app.focus = Focus::Input,
-        KeyCode::Up => focus_prev(app),
-        KeyCode::Down => focus_next(app),
+        KeyCode::Enter => {
+            app.open_cert_modal();
+        }
+        KeyCode::Up => app.move_table_selection(-1),
+        KeyCode::Down => app.move_table_selection(1),
         _ => {}
     }
     Ok(())
@@ -934,16 +1583,288 @@ fn handle_table_search_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.update_table_filter();
             }
         }
-        KeyCode::Up => focus_prev(app),
-        KeyCode::Down => focus_next(app),
+        KeyCode::Up => app.move_table_selection(-1),
+        KeyCode::Down => app.move_table_selection(1),
         _ => {}
     }
     Ok(())
 }
 
+async fn handle_find_dialog(app: &mut App, key: KeyEvent) -> Result<()> {
+    let mut status_update: Option<String> = None;
+    let mut close_dialog = false;
+    let mut exit_early = false;
+    let mut import_path: Option<PathBuf> = None;
+
+    {
+        let dialog = match app.find_dialog.as_mut() {
+            Some(dialog) => dialog,
+            None => return Ok(()),
+        };
+
+        match key.code {
+            KeyCode::Enter => {
+                let trimmed = dialog.input.trim();
+                let root_candidate = if trimmed.is_empty() {
+                    app.default_find_root()
+                } else {
+                    expand_path(trimmed)
+                };
+
+                let root_candidate = if root_candidate.is_file() {
+                    root_candidate
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or(root_candidate)
+                } else {
+                    root_candidate
+                };
+
+                if !root_candidate.exists() {
+                    status_update = Some(format!(
+                        "Find failed: {} does not exist.",
+                        root_candidate.display()
+                    ));
+                    exit_early = true;
+                } else if !root_candidate.is_dir() {
+                    status_update = Some(format!(
+                        "Find failed: {} is not a directory.",
+                        root_candidate.display()
+                    ));
+                    exit_early = true;
+                } else {
+                    let resolved = fs::canonicalize(&root_candidate).unwrap_or(root_candidate);
+                    import_path = Some(resolved);
+                }
+            }
+            KeyCode::Esc => {
+                close_dialog = true;
+                exit_early = true;
+                status_update = Some("Find cancelled.".to_string());
+            }
+            KeyCode::Backspace => {
+                dialog.input.pop();
+            }
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match autocomplete_path_buffer(&mut dialog.input) {
+                    AutocompleteResult::Applied { changed } => {
+                        if changed {
+                            status_update =
+                                Some(format!("Find path autocompleted to {}", dialog.input));
+                        }
+                    }
+                    AutocompleteResult::NoMatch => {
+                        status_update = Some("No completion found for find path.".to_string());
+                    }
+                    AutocompleteResult::NotEligible => {}
+                }
+            }
+            KeyCode::BackTab => match autocomplete_path_buffer(&mut dialog.input) {
+                AutocompleteResult::Applied { changed } => {
+                    if changed {
+                        status_update =
+                            Some(format!("Find path autocompleted to {}", dialog.input));
+                    }
+                }
+                AutocompleteResult::NoMatch => {
+                    status_update = Some("No completion found for find path.".to_string());
+                }
+                AutocompleteResult::NotEligible => {}
+            },
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    dialog.input.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(message) = status_update {
+        app.set_status(message);
+    }
+
+    if let Some(root) = import_path {
+        app.close_find_dialog();
+        app.last_find_root = Some(root.clone());
+        import_system_certificates(app, root).await?;
+        return Ok(());
+    }
+
+    if close_dialog {
+        app.close_find_dialog();
+    }
+
+    if exit_early {
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn import_system_certificates(app: &mut App, root: PathBuf) -> Result<()> {
+    app.set_status(format!(
+        "Searching for certificate files under {} (this can take a while)...",
+        root.display()
+    ));
+    let (paths, had_warnings) = discover_certificate_paths(&root).await?;
+    if paths.is_empty() {
+        app.set_status(format!(
+            "No certificate files found under {}.",
+            root.display()
+        ));
+        return Ok(());
+    }
+
+    let mut seen_paths: HashSet<PathBuf> = app
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            if let TargetKind::Local { path } = &entry.kind {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let total = paths.len();
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut failures = 0usize;
+
+    for (idx, path) in paths.into_iter().enumerate() {
+        if !seen_paths.insert(path.clone()) {
+            skipped += 1;
+            continue;
+        }
+
+        let label = path.display().to_string();
+        app.set_status(format!(
+            "Loading certificates {}/{}: {}",
+            idx + 1,
+            total,
+            label
+        ));
+
+        let kind = TargetKind::Local { path: path.clone() };
+        match load_certs_for(kind.clone(), app.settings.timeout_secs, None).await {
+            Ok(loaded) => {
+                if loaded.certs.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                let status_message = describe_fetch(&kind, &loaded.certs);
+                let entry = TargetEntry::new(
+                    kind,
+                    loaded.certs,
+                    loaded.local_format,
+                    loaded.local_is_dir,
+                    status_message.clone(),
+                );
+                app.upsert_entry(entry);
+                imported += 1;
+            }
+            Err(err) => {
+                if let Some(password_err) = err.downcast_ref::<PasswordRequiredError>() {
+                    failures += 1;
+                    let (status_message, _) = password_required_feedback(&kind, password_err);
+                    app.set_status(format!("Skipping {label}: {status_message}"));
+                    continue;
+                }
+                failures += 1;
+                app.set_status(format!("Skipping {label}: {err}"));
+            }
+        }
+    }
+
+    if imported == 0 {
+        let mut message = format!(
+            "No new certificate entries were added from the scan under {}.",
+            root.display()
+        );
+        if skipped > 0 {
+            message.push_str(&format!(" Skipped {skipped} duplicates or empty files."));
+        }
+        if failures > 0 {
+            message.push_str(&format!(" {failures} paths failed to load."));
+        }
+        if had_warnings {
+            message.push_str(" Some directories could not be scanned (permission denied).");
+        }
+        app.set_status(message);
+        return Ok(());
+    }
+
+    if let Err(err) = app.persist_state() {
+        app.set_status(format!(
+            "Imported {imported} certificate entries but failed to save history: {err}"
+        ));
+    } else {
+        let mut summary = format!(
+            "Imported {imported} certificate entries from {}.",
+            root.display()
+        );
+        if skipped > 0 {
+            summary.push_str(&format!(" Skipped {skipped} duplicates or empty files."));
+        }
+        if failures > 0 {
+            summary.push_str(&format!(" {failures} paths failed to load."));
+        }
+        if had_warnings {
+            summary.push_str(" Some directories could not be scanned (permission denied).");
+        }
+        app.set_status(summary);
+    }
+
+    Ok(())
+}
+
+async fn discover_certificate_paths(root: &Path) -> Result<(Vec<PathBuf>, bool)> {
+    let root = root.to_path_buf();
+    let output = tokio::task::spawn_blocking(move || -> Result<_> {
+        let patterns = [
+            "*.pem", "*.crt", "*.cer", "*.der", "*.p7b", "*.p7c", "*.p12", "*.pfx",
+        ];
+        let mut command = Command::new("find");
+        command.arg(&root);
+        command.args(["-type", "f", "("]);
+        for (idx, pattern) in patterns.iter().enumerate() {
+            if idx > 0 {
+                command.arg("-o");
+            }
+            command.arg("-iname");
+            command.arg(pattern);
+        }
+        command.args([")", "-print0"]);
+        let output = command
+            .output()
+            .with_context(|| format!("failed to execute find starting at {}", root.display()))?;
+        Ok(output)
+    })
+    .await??;
+
+    let had_warnings = !output.stderr.is_empty() || !output.status.success();
+    let mut paths = Vec::new();
+    for chunk in output.stdout.split(|b| *b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let os_path = OsStr::from_bytes(chunk);
+        paths.push(PathBuf::from(os_path));
+    }
+    paths.sort();
+    paths.dedup();
+
+    Ok((paths, had_warnings))
+}
+
 fn focus_next(app: &mut App) {
     match app.focus {
         Focus::Input => {
+            app.stop_input_editing();
             app.ensure_selection();
             app.focus = Focus::History;
         }
@@ -951,6 +1872,7 @@ fn focus_next(app: &mut App) {
             app.focus = Focus::Table;
         }
         Focus::Table => {
+            app.stop_input_editing();
             app.focus = Focus::Input;
         }
         Focus::HistorySearch => {
@@ -967,6 +1889,7 @@ fn focus_next(app: &mut App) {
 fn focus_prev(app: &mut App) {
     match app.focus {
         Focus::Input => {
+            app.stop_input_editing();
             app.ensure_selection();
             app.focus = Focus::Table;
         }
@@ -985,6 +1908,30 @@ fn focus_prev(app: &mut App) {
             app.finish_table_search();
             focus_prev(app);
         }
+    }
+}
+
+fn focus_section(app: &mut App, target: Focus) {
+    if matches!(app.focus, Focus::HistorySearch) {
+        app.finish_history_search();
+    } else if matches!(app.focus, Focus::TableSearch) {
+        app.finish_table_search();
+    }
+
+    match target {
+        Focus::Input => {
+            app.stop_input_editing();
+            app.focus = Focus::Input;
+        }
+        Focus::History => {
+            app.ensure_selection();
+            app.focus = Focus::History;
+        }
+        Focus::Table => {
+            app.ensure_selection();
+            app.focus = Focus::Table;
+        }
+        Focus::HistorySearch | Focus::TableSearch => {}
     }
 }
 
@@ -1071,7 +2018,55 @@ fn leaf_summary(certs: &[CertInfo]) -> Option<String> {
     }
 }
 
-async fn load_certs_for(kind: TargetKind, timeout_secs: u64) -> Result<Vec<CertInfo>> {
+fn password_required_feedback(
+    kind: &TargetKind,
+    error: &PasswordRequiredError,
+) -> (String, Option<LocalCertFormat>) {
+    let mut status = format!(
+        "Password required for {} ({})",
+        kind.label(),
+        error.kind().label()
+    );
+    if let Some(extra) = error.last_error() {
+        status.push_str(&format!(": {extra}"));
+    }
+    status.push_str(" — press Enter in details to unlock.");
+    let format = match error.kind() {
+        ProtectedStoreKind::Pkcs12 => Some(LocalCertFormat::Pkcs12),
+        ProtectedStoreKind::JavaKeystore => Some(LocalCertFormat::JavaKeystore),
+    };
+    (status, format)
+}
+
+struct LoadedCerts {
+    certs: Vec<CertInfo>,
+    local_format: Option<LocalCertFormat>,
+    local_is_dir: Option<bool>,
+}
+
+impl LoadedCerts {
+    fn remote(certs: Vec<CertInfo>) -> Self {
+        Self {
+            certs,
+            local_format: None,
+            local_is_dir: None,
+        }
+    }
+
+    fn local(certs: Vec<CertInfo>, format: LocalCertFormat, is_dir: bool) -> Self {
+        Self {
+            certs,
+            local_format: Some(format),
+            local_is_dir: Some(is_dir),
+        }
+    }
+}
+
+async fn load_certs_for(
+    kind: TargetKind,
+    timeout_secs: u64,
+    password: Option<String>,
+) -> Result<LoadedCerts> {
     match kind {
         TargetKind::Remote { host, port } => {
             let host_for_fetch = host.clone();
@@ -1083,7 +2078,7 @@ async fn load_certs_for(kind: TargetKind, timeout_secs: u64) -> Result<Vec<CertI
             match timeout(Duration::from_secs(timeout_secs), handle).await {
                 Ok(join_result) => {
                     let certs = join_result??;
-                    Ok(certs)
+                    Ok(LoadedCerts::remote(certs))
                 }
                 Err(_) => Err(anyhow!(
                     "Timed out after {}s while fetching {}",
@@ -1093,12 +2088,15 @@ async fn load_certs_for(kind: TargetKind, timeout_secs: u64) -> Result<Vec<CertI
             }
         }
         TargetKind::Local { path } => {
-            let handle = tokio::task::spawn_blocking(move || -> Result<Vec<CertInfo>> {
-                let report = inspect_local_path(&path)?;
-                Ok(report.certs)
-            });
-            let certs = handle.await??;
-            Ok(certs)
+            let pass = password;
+            let handle = tokio::task::spawn_blocking(
+                move || -> Result<(Vec<CertInfo>, LocalCertFormat, bool)> {
+                    let report = inspect_local_path(&path, pass.as_deref())?;
+                    Ok((report.certs, report.format, report.is_dir))
+                },
+            );
+            let (certs, format, is_dir) = handle.await??;
+            Ok(LoadedCerts::local(certs, format, is_dir))
         }
     }
 }
@@ -1109,20 +2107,56 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .margin(1)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(7),
+            Constraint::Min(12),
             Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(f.size());
 
     render_input(f, app, layout[0]);
     render_body(f, app, layout[1]);
-    render_status_panel(f, app, layout[2]);
+    render_filter_bar(f, app, layout[2]);
+    render_status_panel(f, app, layout[3]);
+    render_shortcuts(f, app, layout[4]);
+
+    if app.find_dialog_active() {
+        render_find_dialog(f, app);
+    }
+    if app.password_dialog_active() {
+        render_password_dialog(f, app);
+    } else if app.cert_fullscreen_active() {
+        render_cert_fullscreen(f, app);
+    } else if app.cert_modal_active() {
+        render_cert_modal(f, app);
+    }
+}
+
+fn shortcut_span(text: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(theme.highlight))
+}
+
+fn section_title(shortcut: char, text: &str, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ["),
+        shortcut_span(&shortcut.to_ascii_uppercase().to_string(), theme),
+        Span::raw("] "),
+        Span::raw(text.to_string()),
+    ])
+}
+
+fn label_span(label: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(format!("{label}: "), Style::default().fg(theme.muted))
 }
 
 fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(" target (host:port or path) ");
+    let label = if app.is_input_editing() {
+        "target (editing — host:port or path)"
+    } else {
+        "target (host:port or path)"
+    };
+    let title = section_title('t', label, &app.theme);
+    let mut block = Block::default().borders(Borders::ALL).title(title);
     if matches!(app.focus, Focus::Input) {
         block = block.border_style(Style::default().fg(app.theme.highlight));
     }
@@ -1132,8 +2166,8 @@ fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let body_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(46), Constraint::Min(20)])
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
     render_history_panel(f, app, body_chunks[0]);
@@ -1141,20 +2175,13 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(5),
-        ])
-        .split(area);
-
-    let history_title = match (&app.history_filter, app.focus) {
-        (Some(filter), _) => format!(" history (/ {filter}) "),
-        (None, Focus::HistorySearch) => " history (search) ".to_string(),
-        _ => " history ".to_string(),
+    let history_label = match (&app.history_filter, app.focus) {
+        (Some(filter), _) => format!("history (/ {filter})"),
+        (None, Focus::HistorySearch) => "history (search)".to_string(),
+        _ => "history".to_string(),
     };
+
+    let history_title = section_title('h', &history_label, &app.theme);
 
     let mut block = Block::default().borders(Borders::ALL).title(history_title);
     if matches!(app.focus, Focus::History | Focus::HistorySearch) {
@@ -1164,71 +2191,106 @@ fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible_indices = app.visible_indices();
     if visible_indices.is_empty() {
         let empty = Paragraph::new("No entries yet").block(block);
-        f.render_widget(empty, chunks[0]);
-    } else {
-        let items: Vec<ListItem> = visible_indices
-            .iter()
-            .map(|idx| {
-                let entry = &app.entries[*idx];
-                let color = entry.kind.color(&app.theme);
-                let line = Line::from(vec![
-                    Span::styled(entry.kind.icon(), Style::default().fg(color)),
-                    Span::raw(" "),
-                    Span::styled(entry.label.as_str(), Style::default().fg(color)),
-                    Span::raw(format!(" [{}]", entry.certs.len())),
-                    Span::raw(" "),
-                    Span::styled(entry.status.as_str(), Style::default().fg(app.theme.muted)),
-                ]);
-                ListItem::new(line)
-            })
-            .collect();
-
-        let history = List::new(items)
-            .block(block)
-            .highlight_style(Style::default().fg(app.theme.highlight))
-            .highlight_symbol("> ");
-
-        let selected_pos = app.selected_visible_pos(&visible_indices);
-        if app.history_state.selected() != selected_pos {
-            app.history_state.select(selected_pos);
-        }
-        f.render_stateful_widget(history, chunks[0], &mut app.history_state);
+        f.render_widget(empty, area);
+        return;
     }
 
-    let mut filter_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" history filter ");
-    if matches!(app.focus, Focus::HistorySearch) {
-        filter_block = filter_block.border_style(Style::default().fg(app.theme.highlight));
+    let items: Vec<ListItem> = visible_indices
+        .iter()
+        .map(|idx| {
+            let entry = &app.entries[*idx];
+            ListItem::new(history_line(entry, &app.theme))
+        })
+        .collect();
+
+    let history = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(app.theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    let selected_pos = app.selected_visible_pos(&visible_indices);
+    if app.history_state.selected() != selected_pos {
+        app.history_state.select(selected_pos);
     }
-
-    let filter_text = if matches!(app.focus, Focus::HistorySearch) {
-        format!("/{}", app.history_search_buffer)
-    } else if let Some(filter) = app.history_filter.as_ref() {
-        format!("Active: /{filter}")
-    } else {
-        "Press / while history focused to search".to_string()
-    };
-
-    let filter_widget = Paragraph::new(filter_text).block(filter_block);
-    f.render_widget(filter_widget, chunks[1]);
-
-    let hints = Paragraph::new(vec![
-        Line::from("Tab: cycle focus (Input → History → Table)   Shift+Tab: reverse   Ctrl+R: refresh selection"),
-        Line::from("Ctrl+L: clear history   Up/Down: move history entries   Enter: return to input"),
-        Line::from("/: search focused list   s/i/n/d/o: sort certificates (history or table)"),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" shortcuts "));
-    f.render_widget(hints, chunks[2]);
+    f.render_stateful_widget(history, area, &mut app.history_state);
 }
 
-fn render_table_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
-        .split(area);
+fn icon_for_entry(entry: &TargetEntry) -> &'static str {
+    match &entry.kind {
+        TargetKind::Remote { .. } => "",
+        TargetKind::Local { .. } => {
+            if entry.local_is_dir.unwrap_or(false) {
+                ""
+            } else {
+                match entry.local_format {
+                    Some(LocalCertFormat::Pkcs12) => "",
+                    Some(LocalCertFormat::Pkcs7) => "",
+                    Some(LocalCertFormat::JavaKeystore) => "",
+                    _ => "",
+                }
+            }
+        }
+    }
+}
 
-    let (rows, total, filtered) = if let Some(entry) = app.current_entry() {
+fn history_line(entry: &TargetEntry, theme: &Theme) -> Line<'static> {
+    let color = entry.kind.color(theme);
+    let mut spans = vec![
+        Span::styled(
+            icon_for_entry(entry).to_string(),
+            Style::default().fg(color),
+        ),
+        Span::raw(" "),
+    ];
+
+    match &entry.kind {
+        TargetKind::Local { path } => {
+            let file_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let parent = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            spans.push(Span::styled(file_name, Style::default().fg(color)));
+            spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
+            spans.push(Span::styled(parent, Style::default().fg(theme.muted)));
+        }
+        TargetKind::Remote { .. } => {
+            spans.push(Span::styled(
+                entry.label.clone(),
+                Style::default().fg(color),
+            ));
+            spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
+        }
+    }
+
+    if !entry.status.is_empty() {
+        spans.push(Span::raw(" — "));
+        let status_color = if entry.protected.is_some() {
+            theme.warning
+        } else {
+            theme.muted
+        };
+        spans.push(Span::styled(
+            entry.status.clone(),
+            Style::default().fg(status_color),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.ensure_table_selection();
+
+    let (rows, total, filtered) = if let Some(entry_idx) = app.selected {
+        let entry = &app.entries[entry_idx];
         let indices = app.filtered_cert_indices(entry);
         let total = entry.certs.len();
         let filtered = indices.len();
@@ -1264,13 +2326,22 @@ fn render_table_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
         (Vec::new(), 0, 0)
     };
 
-    let title = if let Some(entry) = app.current_entry() {
-        format!("{} — showing {filtered}/{total} certs", entry.title())
+    let table_label = if let Some(entry) = app.current_entry() {
+        let mut base = format!(
+            "certificates — {} — showing {filtered}/{total}",
+            entry.title()
+        );
+        if entry.protected.is_some() {
+            base.push_str(" — password required");
+        }
+        base
     } else {
-        "No results yet".to_string()
+        "certificates (no results yet)".to_string()
     };
 
-    let mut table_block = Block::default().borders(Borders::ALL).title(title);
+    let table_title = section_title('c', &table_label, &app.theme);
+
+    let mut table_block = Block::default().borders(Borders::ALL).title(table_title);
     if matches!(app.focus, Focus::Table | Focus::TableSearch) {
         table_block = table_block.border_style(Style::default().fg(app.theme.highlight));
     }
@@ -1295,41 +2366,460 @@ fn render_table_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(table_block)
-        .column_spacing(1);
+        .column_spacing(1)
+        .highlight_style(
+            Style::default()
+                .fg(app.theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
 
-    f.render_widget(table, chunks[0]);
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
 
-    let mut filter_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" certificate filter ");
-    if matches!(app.focus, Focus::TableSearch) {
-        filter_block = filter_block.border_style(Style::default().fg(app.theme.highlight));
-    }
-    let filter_text = if matches!(app.focus, Focus::TableSearch) {
-        format!("/{}", app.table_search_buffer)
-    } else if let Some(filter) = app.table_filter.as_ref() {
-        format!("Active: /{filter}")
-    } else {
-        "Press / while table focused to search certificates".to_string()
+fn render_filter_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let (title, line, highlight) = match app.focus {
+        Focus::History | Focus::HistorySearch => (
+            section_title('/', "filter — history", &app.theme),
+            history_filter_line(app),
+            matches!(app.focus, Focus::HistorySearch),
+        ),
+        Focus::Table | Focus::TableSearch => (
+            section_title('/', "filter — certificates", &app.theme),
+            table_filter_line(app),
+            matches!(app.focus, Focus::TableSearch),
+        ),
+        _ => (
+            section_title('/', "filter", &app.theme),
+            Line::from(vec![
+                Span::raw("Focus "),
+                shortcut_span("H", &app.theme),
+                Span::raw(" or "),
+                shortcut_span("C", &app.theme),
+                Span::raw(" panes and press "),
+                shortcut_span("/", &app.theme),
+                Span::raw(" to filter"),
+            ]),
+            false,
+        ),
     };
-    let filter_widget = Paragraph::new(filter_text).block(filter_block);
-    f.render_widget(filter_widget, chunks[1]);
+
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if highlight {
+        block = block.border_style(Style::default().fg(app.theme.highlight));
+    }
+
+    let paragraph = Paragraph::new(line).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn render_shortcuts(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let lines = vec![
+        Line::from(vec![
+            shortcut_span("Enter", &app.theme),
+            Span::raw(": edit target (submit)   "),
+            shortcut_span("Esc", &app.theme),
+            Span::raw(": cancel edit   "),
+            shortcut_span("Tab", &app.theme),
+            Span::raw(": cycle focus   "),
+            shortcut_span("Ctrl+F", &app.theme),
+            Span::raw(": find certificates   "),
+            shortcut_span("Ctrl+R", &app.theme),
+            Span::raw(": refresh"),
+        ]),
+        Line::from(vec![
+            shortcut_span("/", &app.theme),
+            Span::raw(": filter list   "),
+            shortcut_span("Delete", &app.theme),
+            Span::raw("/"),
+            shortcut_span("x", &app.theme),
+            Span::raw(": remove history entry   "),
+            shortcut_span("Enter", &app.theme),
+            Span::raw(" (certs): details   "),
+            shortcut_span("F", &app.theme),
+            Span::raw(" (details): fullscreen   "),
+            shortcut_span("Ctrl+L", &app.theme),
+            Span::raw(": clear history"),
+        ]),
+        Line::from(vec![
+            shortcut_span("S", &app.theme),
+            Span::raw("/"),
+            shortcut_span("I", &app.theme),
+            Span::raw("/"),
+            shortcut_span("N", &app.theme),
+            Span::raw("/"),
+            shortcut_span("D", &app.theme),
+            Span::raw("/"),
+            shortcut_span("O", &app.theme),
+            Span::raw(": sort certificates"),
+        ]),
+    ];
+
+    let shortcuts = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" shortcuts "))
+        .wrap(Wrap { trim: true });
+    f.render_widget(shortcuts, area);
+}
+
+fn history_filter_line(app: &App) -> Line<'static> {
+    if matches!(app.focus, Focus::HistorySearch) {
+        Line::from(vec![
+            shortcut_span("/", &app.theme),
+            Span::raw(app.history_search_buffer.clone()),
+        ])
+    } else if let Some(filter) = app.history_filter.as_ref() {
+        Line::from(vec![
+            Span::raw("Active: "),
+            shortcut_span("/", &app.theme),
+            Span::raw(filter.clone()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("Press "),
+            shortcut_span("/", &app.theme),
+            Span::raw(" to search history"),
+        ])
+    }
+}
+
+fn table_filter_line(app: &App) -> Line<'static> {
+    if matches!(app.focus, Focus::TableSearch) {
+        Line::from(vec![
+            shortcut_span("/", &app.theme),
+            Span::raw(app.table_search_buffer.clone()),
+        ])
+    } else if let Some(filter) = app.table_filter.as_ref() {
+        Line::from(vec![
+            Span::raw("Active: "),
+            shortcut_span("/", &app.theme),
+            Span::raw(filter.clone()),
+        ])
+    } else if let Some(entry) = app.current_entry() {
+        if entry.protected.is_some() {
+            Line::from(vec![
+                Span::raw("Locked: "),
+                shortcut_span("Enter", &app.theme),
+                Span::raw(" to unlock"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw("Press "),
+                shortcut_span("/", &app.theme),
+                Span::raw(" to search certificates"),
+            ])
+        }
+    } else {
+        Line::from(vec![
+            Span::raw("Press "),
+            shortcut_span("/", &app.theme),
+            Span::raw(" to search certificates"),
+        ])
+    }
 }
 
 fn render_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
     let clock = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    let status = Paragraph::new(vec![
-        Line::from(app.status.clone()),
-        Line::from(format!(
-            "Sort: {} ({})",
-            app.sort_key.label(),
-            app.sort_order.label()
-        )),
-        Line::from(format!("Timeout: {}s", app.settings.timeout_secs)),
-        Line::from(clock.to_string()),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" status "));
+    let second_line = format!(
+        "Sort: {} ({})   Timeout: {}s   {}",
+        app.sort_key.label(),
+        app.sort_order.label(),
+        app.settings.timeout_secs,
+        clock
+    );
+    let content = format!("{}\n{}", app.status, second_line);
+    let status = Paragraph::new(content)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title(" status "));
     f.render_widget(status, area);
+}
+
+fn render_password_dialog(f: &mut Frame<'_>, app: &App) {
+    let Some(dialog) = app.password_dialog.as_ref() else {
+        return;
+    };
+    let Some(entry) = app.entries.get(dialog.entry_index) else {
+        return;
+    };
+
+    let area = centered_rect(60, 8, f.size());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Unlock {} ", entry.title());
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "{} ({} store)",
+        entry.kind.label(),
+        dialog.kind.label()
+    )));
+    if let Some(state) = entry.protected.as_ref() {
+        if let Some(err) = state.last_error.as_ref() {
+            lines.push(Line::from(format!("Last error: {err}")));
+        } else {
+            lines.push(Line::default());
+        }
+    } else {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(vec![
+        shortcut_span("Enter", &app.theme),
+        Span::raw(": submit   "),
+        shortcut_span("Esc", &app.theme),
+        Span::raw(": cancel"),
+    ]));
+    let info = Paragraph::new(lines);
+    f.render_widget(info, chunks[0]);
+
+    f.render_widget(Paragraph::new(""), chunks[1]);
+
+    let display: String = dialog.input.chars().map(|_| '*').collect();
+
+    let mut input_block = Block::default().borders(Borders::ALL).title(" password ");
+    input_block = input_block.border_style(Style::default().fg(app.theme.highlight));
+    let input = Paragraph::new(display).block(input_block);
+    f.render_widget(input, chunks[2]);
+}
+
+fn render_find_dialog(f: &mut Frame<'_>, app: &App) {
+    let Some(dialog) = app.find_dialog.as_ref() else {
+        return;
+    };
+    let area = centered_rect(70, 7, f.size());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" find certificates ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let default_root = app.default_find_root();
+    let instructions = Paragraph::new(vec![
+        Line::from("Choose the starting directory for certificate discovery."),
+        Line::from(format!(
+            "Leave blank to use default: {}",
+            default_root.display()
+        )),
+        Line::from(vec![
+            shortcut_span("Enter", &app.theme),
+            Span::raw(": confirm   "),
+            shortcut_span("Esc", &app.theme),
+            Span::raw(": cancel   "),
+            shortcut_span("Tab", &app.theme),
+            Span::raw(": autocomplete path"),
+        ]),
+    ]);
+    f.render_widget(instructions, chunks[0]);
+
+    f.render_widget(Paragraph::new(""), chunks[1]);
+
+    let mut input_block = Block::default().borders(Borders::ALL).title(" start path ");
+    input_block = input_block.border_style(Style::default().fg(app.theme.highlight));
+    let input = Paragraph::new(dialog.input.as_str()).block(input_block);
+    f.render_widget(input, chunks[2]);
+}
+
+fn render_cert_modal(f: &mut Frame<'_>, app: &App) {
+    let Some((entry, idx, cert)) = app.cert_modal_info() else {
+        return;
+    };
+
+    let mut width = ((f.size().width as u32 * 3) / 4) as u16;
+    let mut height = ((f.size().height as u32 * 3) / 4) as u16;
+    width = width.max(60).min(f.size().width);
+    height = height.max(20).min(f.size().height);
+
+    let area = centered_rect(width, height, f.size());
+    f.render_widget(Clear, area);
+
+    let title = format!(" certificate details — {} (index {}) ", entry.title(), idx);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let not_before = cert
+        .not_before_ts
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string());
+    let not_after = cert
+        .not_after_ts
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string());
+    let days_left = days_until_expiry(cert)
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let fingerprint = cert
+        .sha256_fingerprint
+        .as_deref()
+        .unwrap_or("-")
+        .to_string();
+    let san_display = if cert.san.is_empty() {
+        "-".to_string()
+    } else {
+        cert.san.join(", ")
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(inner);
+
+    let details_block = Block::default().borders(Borders::ALL).title(" details ");
+    let details_lines = vec![
+        Line::from(vec![
+            label_span("Subject", &app.theme),
+            Span::raw(cert.subject.clone()),
+        ]),
+        Line::from(vec![
+            label_span("Issuer", &app.theme),
+            Span::raw(cert.issuer.clone()),
+        ]),
+        Line::from(vec![
+            label_span("Not Before (UTC)", &app.theme),
+            Span::raw(not_before),
+        ]),
+        Line::from(vec![
+            label_span("Not After (UTC)", &app.theme),
+            Span::raw(not_after),
+        ]),
+        Line::from(vec![
+            label_span("Days Left", &app.theme),
+            Span::raw(days_left),
+        ]),
+        Line::from(vec![
+            label_span("SHA-256 Fingerprint", &app.theme),
+            Span::raw(fingerprint),
+        ]),
+        Line::from(vec![
+            label_span("Subject Alternative Names", &app.theme),
+            Span::raw(san_display),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            shortcut_span("Esc", &app.theme),
+            Span::raw(": close   "),
+            shortcut_span("Up", &app.theme),
+            Span::raw("/"),
+            shortcut_span("Down", &app.theme),
+            Span::raw(": switch certificate   "),
+            shortcut_span("F", &app.theme),
+            Span::raw(": fullscreen"),
+        ]),
+    ];
+    let details = Paragraph::new(details_lines)
+        .wrap(Wrap { trim: true })
+        .block(details_block);
+    f.render_widget(details, layout[0]);
+
+    let pem_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" certificate (PEM) ");
+    let pem = Paragraph::new(cert.pem.as_str())
+        .wrap(Wrap { trim: false })
+        .block(pem_block);
+    f.render_widget(pem, layout[1]);
+}
+
+fn render_cert_fullscreen(f: &mut Frame<'_>, app: &App) {
+    let Some((entry, idx, cert)) = app.cert_modal_info() else {
+        return;
+    };
+
+    f.render_widget(Clear, f.size());
+
+    let fullscreen_title = Line::from(vec![
+        Span::raw(" ["),
+        shortcut_span("F", &app.theme),
+        Span::raw("] fullscreen certificate — "),
+        Span::raw(format!("{} (index {}) ", entry.title(), idx)),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(fullscreen_title);
+
+    let inner = block.inner(f.size());
+    f.render_widget(block, f.size());
+
+    let not_before = cert
+        .not_before_ts
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string());
+    let not_after = cert
+        .not_after_ts
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string());
+    let days_left = days_until_expiry(cert)
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        label_span("Subject", &app.theme),
+        Span::raw(cert.subject.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        label_span("Issuer", &app.theme),
+        Span::raw(cert.issuer.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        label_span("Not Before (UTC)", &app.theme),
+        Span::raw(not_before),
+    ]));
+    lines.push(Line::from(vec![
+        label_span("Not After (UTC)", &app.theme),
+        Span::raw(not_after),
+    ]));
+    lines.push(Line::from(vec![
+        label_span("Days Left", &app.theme),
+        Span::raw(days_left),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        shortcut_span("Any key", &app.theme),
+        Span::raw(": exit fullscreen"),
+    ]));
+    lines.push(Line::default());
+
+    for pem_line in cert.pem.lines() {
+        lines.push(Line::from(pem_line.to_string()));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(paragraph, inner);
+}
+
+fn centered_rect(width: u16, height: u16, container: Rect) -> Rect {
+    let width = width.min(container.width);
+    let height = height.min(container.height);
+    let x = container.x + (container.width.saturating_sub(width)) / 2;
+    let y = container.y + (container.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
 }
 
 fn header_with_sort(label: &str, key: SortKey, app: &App) -> String {
@@ -1344,26 +2834,44 @@ fn header_with_sort(label: &str, key: SortKey, app: &App) -> String {
     }
 }
 
+enum AutocompleteResult {
+    Applied { changed: bool },
+    NoMatch,
+    NotEligible,
+}
+
 fn try_autocomplete_input(app: &mut App) -> bool {
-    let trimmed = app.input.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if !(looks_like_path(trimmed) || path_exists(trimmed)) {
-        return false;
-    }
-    match autocomplete_path(trimmed) {
-        Some(completed) => {
-            if completed != trimmed {
-                app.input = completed.clone();
-                app.set_status(format!("Path autocompleted to {completed}"));
+    match autocomplete_path_buffer(&mut app.input) {
+        AutocompleteResult::Applied { changed } => {
+            if changed {
+                app.set_status(format!("Path autocompleted to {}", app.input));
             }
             true
         }
-        None => {
+        AutocompleteResult::NoMatch => {
             app.set_status("No completion found for path input.");
             true
         }
+        AutocompleteResult::NotEligible => false,
+    }
+}
+
+fn autocomplete_path_buffer(buffer: &mut String) -> AutocompleteResult {
+    let trimmed = buffer.trim();
+    if trimmed.is_empty() {
+        return AutocompleteResult::NotEligible;
+    }
+    if !(looks_like_path(trimmed) || path_exists(trimmed)) {
+        return AutocompleteResult::NotEligible;
+    }
+    match autocomplete_path(trimmed) {
+        Some(completed) => {
+            let changed = completed != trimmed;
+            buffer.clear();
+            buffer.push_str(&completed);
+            AutocompleteResult::Applied { changed }
+        }
+        None => AutocompleteResult::NoMatch,
     }
 }
 
