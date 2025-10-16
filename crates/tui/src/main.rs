@@ -383,6 +383,25 @@ enum SortOrder {
     Desc,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistorySortKey {
+    Insertion,
+    DaysLeft,
+    Location,
+    Name,
+}
+
+impl HistorySortKey {
+    fn label(self) -> &'static str {
+        match self {
+            HistorySortKey::Insertion => "insertion",
+            HistorySortKey::DaysLeft => "minimum days left",
+            HistorySortKey::Location => "location",
+            HistorySortKey::Name => "name",
+        }
+    }
+}
+
 impl SortOrder {
     fn toggle(self) -> Self {
         match self {
@@ -623,6 +642,8 @@ struct App {
     table_search_buffer: String,
     sort_key: SortKey,
     sort_order: SortOrder,
+    history_sort: HistorySortKey,
+    history_sort_order: SortOrder,
     dirty: bool,
     history_state: ListState,
     table_state: TableState,
@@ -656,6 +677,8 @@ impl Default for App {
             table_search_buffer: String::new(),
             sort_key: SortKey::Chain,
             sort_order: SortOrder::Asc,
+            history_sort: HistorySortKey::Insertion,
+            history_sort_order: SortOrder::Asc,
             dirty: false,
             history_state: ListState::default(),
             table_state: TableState::default(),
@@ -841,6 +864,7 @@ impl App {
         } else {
             indices.extend(0..self.entries.len());
         }
+        self.sort_history_indices(&mut indices);
         indices
     }
 
@@ -863,6 +887,79 @@ impl App {
         }
         self.active_truststore = new_value;
         Ok(())
+    }
+
+    fn set_history_sort(&mut self, sort: HistorySortKey) -> SortOrder {
+        if self.history_sort == sort {
+            self.history_sort_order = self.history_sort_order.toggle();
+        } else {
+            self.history_sort = sort;
+            self.history_sort_order = SortOrder::Asc;
+        }
+        self.sync_history_state();
+        self.history_sort_order
+    }
+
+    fn sort_history_indices(&self, indices: &mut [usize]) {
+        match self.history_sort {
+            HistorySortKey::Insertion => {}
+            HistorySortKey::DaysLeft => indices.sort_by(|a, b| {
+                let entry_a = &self.entries[*a];
+                let entry_b = &self.entries[*b];
+                compare_days(entry_a, entry_b)
+                    .then_with(|| entry_sort_name(entry_a).cmp(&entry_sort_name(entry_b)))
+                    .then_with(|| a.cmp(b))
+            }),
+            HistorySortKey::Location => indices.sort_by(|a, b| {
+                let entry_a = &self.entries[*a];
+                let entry_b = &self.entries[*b];
+                entry_location_key(entry_a)
+                    .cmp(&entry_location_key(entry_b))
+                    .then_with(|| entry_sort_name(entry_a).cmp(&entry_sort_name(entry_b)))
+                    .then_with(|| compare_days(entry_a, entry_b))
+                    .then_with(|| a.cmp(b))
+            }),
+            HistorySortKey::Name => indices.sort_by(|a, b| {
+                let entry_a = &self.entries[*a];
+                let entry_b = &self.entries[*b];
+                entry_sort_name(entry_a)
+                    .cmp(&entry_sort_name(entry_b))
+                    .then_with(|| compare_days(entry_a, entry_b))
+                    .then_with(|| a.cmp(b))
+            }),
+        }
+        if self.history_sort != HistorySortKey::Insertion {
+            match self.history_sort_order {
+                SortOrder::Asc => {}
+                SortOrder::Desc => match self.history_sort {
+                    HistorySortKey::DaysLeft => indices.sort_by(|a, b| {
+                        let entry_a = &self.entries[*a];
+                        let entry_b = &self.entries[*b];
+                        compare_days(entry_b, entry_a)
+                            .then_with(|| entry_sort_name(entry_a).cmp(&entry_sort_name(entry_b)))
+                            .then_with(|| a.cmp(b))
+                    }),
+                    HistorySortKey::Location => indices.sort_by(|a, b| {
+                        let entry_a = &self.entries[*a];
+                        let entry_b = &self.entries[*b];
+                        entry_location_key(entry_b)
+                            .cmp(&entry_location_key(entry_a))
+                            .then_with(|| entry_sort_name(entry_a).cmp(&entry_sort_name(entry_b)))
+                            .then_with(|| compare_days(entry_a, entry_b))
+                            .then_with(|| a.cmp(b))
+                    }),
+                    HistorySortKey::Name => indices.sort_by(|a, b| {
+                        let entry_a = &self.entries[*a];
+                        let entry_b = &self.entries[*b];
+                        entry_sort_name(entry_b)
+                            .cmp(&entry_sort_name(entry_a))
+                            .then_with(|| compare_days(entry_a, entry_b))
+                            .then_with(|| a.cmp(b))
+                    }),
+                    HistorySortKey::Insertion => {}
+                },
+            }
+        }
     }
 
     fn apply_selection(&mut self, idx: usize) {
@@ -1745,6 +1842,38 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                match c {
+                    'D' => {
+                        let order = app.set_history_sort(HistorySortKey::DaysLeft);
+                        app.set_status(format!(
+                            "History sorted by {} ({}).",
+                            HistorySortKey::DaysLeft.label(),
+                            order.label()
+                        ));
+                        return Ok(());
+                    }
+                    'L' => {
+                        let order = app.set_history_sort(HistorySortKey::Location);
+                        app.set_status(format!(
+                            "History sorted by {} ({}).",
+                            HistorySortKey::Location.label(),
+                            order.label()
+                        ));
+                        return Ok(());
+                    }
+                    'N' => {
+                        let order = app.set_history_sort(HistorySortKey::Name);
+                        app.set_status(format!(
+                            "History sorted by {} ({}).",
+                            HistorySortKey::Name.label(),
+                            order.label()
+                        ));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
             let command = c.to_ascii_lowercase();
             match command {
                 'k' => app.move_selection(-1),
@@ -2818,7 +2947,7 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
     let color = entry.kind.color(theme);
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    let min_days_left = entry.certs.iter().filter_map(days_until_expiry).min();
+    let min_days_left = entry_min_days_left(entry);
 
     if is_active_truststore {
         spans.push(Span::styled(
@@ -2847,14 +2976,9 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
             spans.push(Span::styled(file_name, Style::default().fg(color)));
             spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
             if let Some(days) = min_days_left {
-                let day_color = match days {
-                    d if d < 0 => theme.danger,
-                    d if d <= 30 => theme.warning,
-                    _ => theme.success,
-                };
                 spans.push(Span::styled(
                     format!("{days}d "),
-                    Style::default().fg(day_color),
+                    Style::default().fg(day_color(theme, days)),
                 ));
             }
             spans.push(Span::styled(parent, Style::default().fg(theme.muted)));
@@ -2866,14 +2990,9 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
             ));
             spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
             if let Some(days) = min_days_left {
-                let day_color = match days {
-                    d if d < 0 => theme.danger,
-                    d if d <= 30 => theme.warning,
-                    _ => theme.success,
-                };
                 spans.push(Span::styled(
                     format!("{days}d "),
-                    Style::default().fg(day_color),
+                    Style::default().fg(day_color(theme, days)),
                 ));
             }
         }
@@ -2893,6 +3012,47 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
     }
 
     Line::from(spans)
+}
+
+fn entry_min_days_left(entry: &TargetEntry) -> Option<i64> {
+    entry.certs.iter().filter_map(days_until_expiry).min()
+}
+
+fn day_color(theme: &Theme, days: i64) -> Color {
+    if days < 0 {
+        theme.danger
+    } else if days <= 30 {
+        theme.warning
+    } else {
+        theme.success
+    }
+}
+
+fn entry_sort_name(entry: &TargetEntry) -> String {
+    match &entry.kind {
+        TargetKind::Local { path } => path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+            .to_ascii_lowercase(),
+        TargetKind::Remote { .. } => entry.label.to_ascii_lowercase(),
+    }
+}
+
+fn entry_location_key(entry: &TargetEntry) -> u8 {
+    match entry.kind {
+        TargetKind::Local { .. } => 0,
+        TargetKind::Remote { .. } => 1,
+    }
+}
+
+fn compare_days(a: &TargetEntry, b: &TargetEntry) -> Ordering {
+    match (entry_min_days_left(a), entry_min_days_left(b)) {
+        (Some(da), Some(db)) => da.cmp(&db),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 fn render_certificate_background(f: &mut Frame<'_>, area: Rect, theme: &Theme, skip_lines: u16) {

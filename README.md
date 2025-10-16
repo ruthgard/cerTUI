@@ -105,6 +105,9 @@ Modals overlay the above:
 | `Enter` | Focus target input (data copied but not cleared). |
 | `Delete` / `x` | Remove entry. |
 | `s`, `i`, `n`, `d`, `o` | Sort certificates (Subject, Issuer, Not After, Days Left, Chain order). |
+| `D` | Sort history by minimum days left (press again to reverse order). |
+| `L` | Sort history by location (Local before Remote; press again to reverse). |
+| `N` | Sort history by name (ties break on days left; press again to reverse). |
 | `T` | Mark the selected entry as the active trust store. |
 | `V` | Verify the selected entry against the active trust store. |
 
