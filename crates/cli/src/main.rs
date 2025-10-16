@@ -60,6 +60,15 @@ fn main() -> Result<()> {
             } else {
                 println!("No certs parsed.");
             }
+            if report.requires_mtls {
+                println!("Requires mTLS");
+                if !report.client_ca_names.is_empty() {
+                    println!("Acceptable client certificate CA names:");
+                    for name in &report.client_ca_names {
+                        println!("  - {}", name);
+                    }
+                }
+            }
             println!("\nChain:");
             for (i, c) in report.certs.iter().enumerate() {
                 println!("  [{}] {}", i, c.subject);

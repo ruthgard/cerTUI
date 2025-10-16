@@ -1,12 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,15 @@ pub struct InspectReport {
     pub port: u16,
     pub sni: Option<String>,
     pub certs: Vec<CertInfo>,
+    pub requires_mtls: bool,
+    #[serde(default)]
+    pub client_ca_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustValidation {
+    pub trusted: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +154,47 @@ fn extract_pems(s: &str) -> Vec<String> {
     re.find_iter(s).map(|m| m.as_str().to_string()).collect()
 }
 
+fn parse_client_ca_names(output: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        if line
+            .trim()
+            .eq_ignore_ascii_case("acceptable client certificate CA names")
+        {
+            for name_line in &mut lines {
+                let trimmed = name_line.trim();
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("requested signature algorithms:")
+                    || trimmed.eq_ignore_ascii_case("client certificate types:")
+                    || trimmed.starts_with("---")
+                {
+                    break;
+                }
+                names.push(trimmed.to_string());
+            }
+            break;
+        }
+    }
+    names
+}
+
+fn parse_requires_mtls(output: &str) -> (bool, Vec<String>) {
+    let lower = output.to_ascii_lowercase();
+    let has_req = lower.contains("acceptable client certificate ca names")
+        || lower.contains("client certificate types");
+    let mut requires = has_req;
+    if !requires {
+        requires = lower.contains("alert handshake failure") && lower.contains("certificate");
+    }
+    let names = if requires {
+        parse_client_ca_names(output)
+    } else {
+        Vec::new()
+    };
+    (requires, names)
+}
+
 fn parse_pem_cert(pem_str: &str) -> Result<CertInfo> {
     use x509_parser::prelude::FromDer;
 
@@ -201,6 +252,7 @@ fn parse_pem_cert(pem_str: &str) -> Result<CertInfo> {
 
 pub fn inspect_remote(host: &str, port: u16, sni: Option<&str>) -> Result<InspectReport> {
     let output = openssl_s_client(host, port, sni)?;
+    let (requires_mtls, client_ca_names) = parse_requires_mtls(&output);
     let pems = extract_pems(&output);
     let mut certs = Vec::new();
     for p in pems {
@@ -214,7 +266,84 @@ pub fn inspect_remote(host: &str, port: u16, sni: Option<&str>) -> Result<Inspec
         port,
         sni: sni.map(|s| s.to_string()),
         certs,
+        requires_mtls,
+        client_ca_names,
     })
+}
+
+pub fn verify_with_truststore(
+    trust_certs: &[CertInfo],
+    target_chain: &[CertInfo],
+) -> Result<TrustValidation> {
+    if trust_certs.is_empty() {
+        return Err(anyhow!("trust store has no certificates"));
+    }
+    if target_chain.is_empty() {
+        return Err(anyhow!("target entry has no certificates"));
+    }
+
+    let mut trust_file =
+        NamedTempFile::new().context("failed to create temporary trust store file")?;
+    for cert in trust_certs {
+        writeln!(trust_file, "{}", cert.pem)?;
+    }
+    trust_file
+        .flush()
+        .context("failed to write temporary trust store file")?;
+
+    let mut leaf_file =
+        NamedTempFile::new().context("failed to create temporary leaf certificate file")?;
+    writeln!(leaf_file, "{}", target_chain[0].pem)?;
+    leaf_file
+        .flush()
+        .context("failed to write temporary leaf certificate file")?;
+
+    let intermediate_file = if target_chain.len() > 1 {
+        let mut file =
+            NamedTempFile::new().context("failed to create temporary intermediates file")?;
+        for cert in &target_chain[1..] {
+            writeln!(file, "{}", cert.pem)?;
+        }
+        file.flush()
+            .context("failed to write temporary intermediates file")?;
+        Some(file)
+    } else {
+        None
+    };
+
+    let mut cmd = Command::new("openssl");
+    cmd.arg("verify").arg("-CAfile").arg(trust_file.path());
+    if let Some(intermediate) = intermediate_file.as_ref() {
+        cmd.arg("-untrusted").arg(intermediate.path());
+    }
+    cmd.arg(leaf_file.path());
+
+    let output = cmd
+        .output()
+        .with_context(|| "failed to execute openssl verify")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let trusted = output.status.success();
+
+    let mut message_parts = Vec::new();
+    if !stdout.is_empty() {
+        message_parts.push(stdout);
+    }
+    if !stderr.is_empty() {
+        message_parts.push(stderr);
+    }
+    let message = if message_parts.is_empty() {
+        if trusted {
+            "Verification succeeded.".to_string()
+        } else {
+            "Verification failed.".to_string()
+        }
+    } else {
+        message_parts.join(" ")
+    };
+
+    Ok(TrustValidation { trusted, message })
 }
 
 /// Utility: days until expiry for convenience

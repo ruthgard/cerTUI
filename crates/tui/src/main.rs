@@ -22,8 +22,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use omarchy_cert_core::{
-    days_until_expiry, inspect_local_path, inspect_remote, CertInfo, LocalCertFormat,
-    PasswordRequiredError, ProtectedStoreKind,
+    days_until_expiry, inspect_local_path, inspect_remote, verify_with_truststore, CertInfo,
+    InspectReport, LocalCertFormat, PasswordRequiredError, ProtectedStoreKind,
 };
 use ratatui::layout::Margin;
 use ratatui::{
@@ -294,6 +294,7 @@ fn initialize_app() -> App {
         }
     };
     app.settings = settings;
+    app.active_truststore = app.settings.active_truststore.clone();
 
     let (theme, theme_msg) = load_theme();
     app.theme = theme;
@@ -313,6 +314,14 @@ fn initialize_app() -> App {
                     entry.rehydrate_label();
                 }
                 app.entries = entries;
+                if let Some(kind) = app.active_truststore.as_ref() {
+                    if app.find_entry_by_kind(kind).is_none() {
+                        parts.push(format!(
+                            "Configured trust store {} not in history.",
+                            kind.label()
+                        ));
+                    }
+                }
                 app.ensure_selection();
                 parts.push(format!(
                     "Loaded {} entries from {}.",
@@ -436,6 +445,10 @@ struct TargetEntry {
     local_format: Option<LocalCertFormat>,
     #[serde(default)]
     local_is_dir: Option<bool>,
+    #[serde(default)]
+    requires_mtls: bool,
+    #[serde(default)]
+    client_ca_names: Vec<String>,
     #[serde(skip)]
     protected: Option<ProtectedState>,
 }
@@ -447,6 +460,8 @@ impl TargetEntry {
         local_format: Option<LocalCertFormat>,
         local_is_dir: Option<bool>,
         status: String,
+        requires_mtls: bool,
+        client_ca_names: Vec<String>,
     ) -> Self {
         let label = kind.label();
         Self {
@@ -456,6 +471,8 @@ impl TargetEntry {
             status,
             local_format,
             local_is_dir,
+            requires_mtls,
+            client_ca_names,
             protected: None,
         }
     }
@@ -474,16 +491,30 @@ impl TargetEntry {
         let status_match = self.status.to_ascii_lowercase().contains(&needle);
         label_match || status_match
     }
+
+    fn is_truststore_candidate(&self) -> bool {
+        if self.certs.is_empty() {
+            return false;
+        }
+        match self.kind {
+            TargetKind::Local { .. } => self.protected.is_none(),
+            TargetKind::Remote { .. } => self.requires_mtls,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Settings {
     timeout_secs: u64,
+    active_truststore: Option<TargetKind>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { timeout_secs: 5 }
+        Self {
+            timeout_secs: 5,
+            active_truststore: None,
+        }
     }
 }
 
@@ -517,7 +548,10 @@ impl Settings {
         let raw: SettingsFile = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         let timeout_secs = raw.timeout_secs.unwrap_or(Settings::default().timeout_secs);
-        let settings = Settings { timeout_secs };
+        let settings = Settings {
+            timeout_secs,
+            active_truststore: raw.active_truststore,
+        };
         let msg = format!(
             "Loaded settings from {} (timeout {}s).",
             settings_display_path(),
@@ -534,6 +568,7 @@ impl Settings {
         }
         let raw = SettingsFile {
             timeout_secs: Some(self.timeout_secs),
+            active_truststore: self.active_truststore.clone(),
         };
         let data =
             serde_json::to_string_pretty(&raw).context("failed to serialize settings file")?;
@@ -545,6 +580,8 @@ impl Settings {
 #[derive(Serialize, Deserialize)]
 struct SettingsFile {
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    active_truststore: Option<TargetKind>,
 }
 
 #[derive(Clone)]
@@ -591,6 +628,7 @@ struct App {
     table_state: TableState,
     settings: Settings,
     theme: Theme,
+    active_truststore: Option<TargetKind>,
     find_dialog: Option<FindDialog>,
     last_find_root: Option<PathBuf>,
     password_dialog: Option<PasswordDialog>,
@@ -623,6 +661,7 @@ impl Default for App {
             table_state: TableState::default(),
             settings: Settings::default(),
             theme: Theme::default(),
+            active_truststore: None,
             find_dialog: None,
             last_find_root: None,
             password_dialog: None,
@@ -772,7 +811,7 @@ impl App {
         self.select_actual(0);
     }
 
-    fn clear_entries(&mut self) {
+    fn clear_entries(&mut self) -> Result<()> {
         self.entries.clear();
         self.selected = None;
         self.history_filter = None;
@@ -787,6 +826,8 @@ impl App {
         self.input.clear();
         self.input_edit_mode = true;
         self.mark_dirty();
+        self.clear_active_truststore()?;
+        Ok(())
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -801,6 +842,27 @@ impl App {
             indices.extend(0..self.entries.len());
         }
         indices
+    }
+
+    fn find_entry_by_kind(&self, kind: &TargetKind) -> Option<usize> {
+        self.entries.iter().position(|entry| &entry.kind == kind)
+    }
+
+    fn is_active_truststore_kind(&self, kind: &TargetKind) -> bool {
+        self.active_truststore
+            .as_ref()
+            .map_or(false, |active| active == kind)
+    }
+
+    fn update_active_truststore_setting(&mut self, new_value: Option<TargetKind>) -> Result<()> {
+        let previous = self.settings.active_truststore.clone();
+        self.settings.active_truststore = new_value.clone();
+        if let Err(err) = self.settings.save() {
+            self.settings.active_truststore = previous;
+            return Err(err);
+        }
+        self.active_truststore = new_value;
+        Ok(())
     }
 
     fn apply_selection(&mut self, idx: usize) {
@@ -850,6 +912,51 @@ impl App {
         let next_pos = (current_pos as isize + delta).clamp(0, max_pos) as usize;
         let next_actual = visible[next_pos];
         self.apply_selection(next_actual);
+    }
+
+    fn activate_truststore_by_index(&mut self, idx: usize) -> Result<String> {
+        let (kind, title, cert_count, requires_mtls, client_ca_names) = {
+            let entry = self
+                .entries
+                .get(idx)
+                .ok_or_else(|| anyhow!("Selected entry is no longer available"))?;
+            if !entry.is_truststore_candidate() {
+                bail!("Selected entry cannot act as a trust store.");
+            }
+            if entry.certs.is_empty() {
+                bail!("Selected entry has no certificates to use as a trust store.");
+            }
+            (
+                entry.kind.clone(),
+                entry.title(),
+                entry.certs.len(),
+                entry.requires_mtls,
+                entry.client_ca_names.clone(),
+            )
+        };
+        self.update_active_truststore_setting(Some(kind))?;
+        let mut message = format!(
+            "Selected {} as active trust store ({} certs).",
+            title, cert_count
+        );
+        if requires_mtls {
+            message.push_str(" Source requires mTLS");
+            if !client_ca_names.is_empty() {
+                message.push_str(&format!(
+                    " (acceptable client CA names: {})",
+                    client_ca_names.join(", ")
+                ));
+            }
+            message.push('.');
+        }
+        if !message.ends_with('.') {
+            message.push('.');
+        }
+        Ok(message)
+    }
+
+    fn clear_active_truststore(&mut self) -> Result<()> {
+        self.update_active_truststore_setting(None)
     }
 
     fn remove_selected_entry(&mut self) -> Option<TargetEntry> {
@@ -932,9 +1039,16 @@ impl App {
         local_format: Option<LocalCertFormat>,
         local_is_dir: Option<bool>,
     ) {
+        let was_active = self
+            .entries
+            .get(idx)
+            .map(|entry| self.is_active_truststore_kind(&entry.kind))
+            .unwrap_or(false);
         if let Some(entry) = self.entries.get_mut(idx) {
             entry.protected = Some(state);
             entry.certs.clear();
+            entry.requires_mtls = false;
+            entry.client_ca_names.clear();
             if let Some(format) = local_format {
                 entry.local_format = Some(format);
             }
@@ -946,6 +1060,20 @@ impl App {
             }
             self.mark_dirty();
         }
+        if was_active {
+            if let Err(err) = self.clear_active_truststore() {
+                eprintln!(
+                    "warn: failed to clear active trust store after entry became protected: {err}"
+                );
+            }
+        }
+    }
+
+    fn set_entry_status_message(&mut self, idx: usize, status: String) {
+        if let Some(entry) = self.entries.get_mut(idx) {
+            entry.status = status;
+            self.mark_dirty();
+        }
     }
 
     fn update_entry_certs(
@@ -955,13 +1083,22 @@ impl App {
         loaded: LoadedCerts,
         status: String,
     ) {
+        let LoadedCerts {
+            certs,
+            local_format,
+            local_is_dir,
+            requires_mtls,
+            client_ca_names,
+        } = loaded;
         if let Some(entry) = self.entries.get_mut(idx) {
-            entry.certs = loaded.certs;
+            entry.certs = certs;
             entry.status = status;
             entry.protected = None;
             entry.label = kind.label();
-            entry.local_format = loaded.local_format;
-            entry.local_is_dir = loaded.local_is_dir;
+            entry.local_format = local_format;
+            entry.local_is_dir = local_is_dir;
+            entry.requires_mtls = requires_mtls;
+            entry.client_ca_names = client_ca_names;
         }
         self.mark_dirty();
         self.table_state.select(None);
@@ -1293,10 +1430,16 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
     }
 
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.clear_entries();
-        app.set_status("History cleared.");
-        if let Err(err) = app.persist_state() {
-            app.set_status(format!("History cleared but failed to save: {err}"));
+        match app.clear_entries() {
+            Ok(()) => {
+                app.set_status("History cleared.");
+                if let Err(err) = app.persist_state() {
+                    app.set_status(format!("History cleared but failed to save: {err}"));
+                }
+            }
+            Err(err) => {
+                app.set_status(format!("Failed to clear history: {err}"));
+            }
         }
         return Ok(true);
     }
@@ -1306,13 +1449,26 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
             app.set_status(kind.loading_message());
             match load_certs_for(kind.clone(), app.settings.timeout_secs, None).await {
                 Ok(loaded) => {
-                    let status_message = describe_fetch(&kind, &loaded.certs);
+                    let LoadedCerts {
+                        certs,
+                        local_format,
+                        local_is_dir,
+                        requires_mtls,
+                        client_ca_names,
+                    } = loaded;
+                    let status_message = annotate_mtls_status(
+                        describe_fetch(&kind, &certs),
+                        requires_mtls,
+                        &client_ca_names,
+                    );
                     let entry = TargetEntry::new(
                         kind,
-                        loaded.certs,
-                        loaded.local_format,
-                        loaded.local_is_dir,
+                        certs,
+                        local_format,
+                        local_is_dir,
                         status_message.clone(),
+                        requires_mtls,
+                        client_ca_names,
                     );
                     app.upsert_entry(entry);
                     if let Err(err) = app.persist_state() {
@@ -1347,6 +1503,8 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
                                 local_format,
                                 Some(path.is_dir()),
                                 status_message.clone(),
+                                false,
+                                Vec::new(),
                             );
                             entry.protected = Some(ProtectedState::new(
                                 password_err.kind(),
@@ -1487,6 +1645,8 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                             local_format,
                             Some(path.is_dir()),
                             status_message.clone(),
+                            false,
+                            Vec::new(),
                         );
                         entry.protected = Some(ProtectedState::new(
                             password_err.kind(),
@@ -1501,13 +1661,26 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                     return Ok(());
                 }
             };
-            let status_message = describe_fetch(&kind, &loaded.certs);
+            let LoadedCerts {
+                certs,
+                local_format,
+                local_is_dir,
+                requires_mtls,
+                client_ca_names,
+            } = loaded;
+            let status_message = annotate_mtls_status(
+                describe_fetch(&kind, &certs),
+                requires_mtls,
+                &client_ca_names,
+            );
             let entry = TargetEntry::new(
                 kind.clone(),
-                loaded.certs,
-                loaded.local_format,
-                loaded.local_is_dir,
+                certs,
+                local_format,
+                local_is_dir,
                 status_message.clone(),
+                requires_mtls,
+                client_ca_names,
             );
             app.upsert_entry(entry);
             if let Err(err) = app.persist_state() {
@@ -1553,7 +1726,16 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Delete => {
             if let Some(entry) = app.remove_selected_entry() {
                 let label = entry.kind.label();
-                app.set_status(format!("Removed {label} from history."));
+                let mut message = format!("Removed {label} from history.");
+                if app.is_active_truststore_kind(&entry.kind) {
+                    match app.clear_active_truststore() {
+                        Ok(()) => message.push_str(" Active trust store cleared."),
+                        Err(err) => {
+                            message.push_str(&format!(" Failed to clear active trust store: {err}"))
+                        }
+                    }
+                }
+                app.set_status(message.clone());
                 if let Err(err) = app.persist_state() {
                     app.set_status(format!("Removed {label} but failed to save: {err}"));
                 }
@@ -1567,10 +1749,32 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 'n' => app.set_sort(SortKey::NotAfter),
                 'd' => app.set_sort(SortKey::DaysLeft),
                 'o' => app.set_sort(SortKey::Chain),
+                't' => {
+                    if let Some(idx) = app.selected {
+                        match app.activate_truststore_by_index(idx) {
+                            Ok(message) => app.set_status(message),
+                            Err(err) => app.set_status(format!("Failed to set trust store: {err}")),
+                        }
+                    } else {
+                        app.set_status("No history entry selected.");
+                    }
+                }
+                'v' => {
+                    verify_selected_against_truststore(app).await?;
+                }
                 'x' => {
                     if let Some(entry) = app.remove_selected_entry() {
                         let label = entry.kind.label();
-                        app.set_status(format!("Removed {label} from history."));
+                        let mut message = format!("Removed {label} from history.");
+                        if app.is_active_truststore_kind(&entry.kind) {
+                            match app.clear_active_truststore() {
+                                Ok(()) => message.push_str(" Active trust store cleared."),
+                                Err(err) => message.push_str(&format!(
+                                    " Failed to clear active trust store: {err}"
+                                )),
+                            }
+                        }
+                        app.set_status(message.clone());
                         if let Err(err) = app.persist_state() {
                             app.set_status(format!("Removed {label} but failed to save: {err}"));
                         }
@@ -1581,6 +1785,90 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn verify_selected_against_truststore(app: &mut App) -> Result<()> {
+    let Some(selected_idx) = app.selected else {
+        app.set_status("No history entry selected to verify.");
+        return Ok(());
+    };
+
+    let Some(active_kind) = app.active_truststore.clone() else {
+        app.set_status("No active trust store. Press T on a trust store entry to select one.");
+        return Ok(());
+    };
+
+    let Some(trust_idx) = app.find_entry_by_kind(&active_kind) else {
+        app.set_status(format!(
+            "Active trust store {} is not present in history.",
+            active_kind.label()
+        ));
+        return Ok(());
+    };
+
+    let (trust_label, trust_certs) = {
+        let Some(entry) = app.entries.get(trust_idx) else {
+            app.set_status("Active trust store entry is not available.");
+            return Ok(());
+        };
+        if entry.certs.is_empty() {
+            app.set_status(format!(
+                "Active trust store {} has no certificates.",
+                entry.title()
+            ));
+            return Ok(());
+        }
+        (entry.title(), entry.certs.clone())
+    };
+
+    let (target_label, target_certs) = {
+        let Some(entry) = app.entries.get(selected_idx) else {
+            app.set_status("Selected entry is no longer available.");
+            return Ok(());
+        };
+        if entry.certs.is_empty() {
+            app.set_status(format!("{} has no certificates to verify.", entry.title()));
+            return Ok(());
+        }
+        (entry.title(), entry.certs.clone())
+    };
+
+    app.set_status(format!(
+        "Verifying {} against {} ...",
+        target_label, trust_label
+    ));
+
+    let validation =
+        tokio::task::spawn_blocking(move || verify_with_truststore(&trust_certs, &target_certs))
+            .await
+            .context("verification task failed to run")??;
+
+    let mut message = if validation.trusted {
+        format!("{target_label} is trusted by {trust_label}")
+    } else {
+        format!("{target_label} is NOT trusted by {trust_label}")
+    };
+
+    if !validation.message.is_empty() {
+        if !message.ends_with('.') {
+            message.push('.');
+        }
+        message.push(' ');
+        message.push_str(&validation.message);
+        if !message.ends_with('.') {
+            message.push('.');
+        }
+    } else if !message.ends_with('.') {
+        message.push('.');
+    }
+
+    app.set_entry_status_message(selected_idx, message.clone());
+    match app.persist_state() {
+        Ok(()) => app.set_status(message),
+        Err(err) => app.set_status(format!("{message} (failed to save: {err})")),
+    }
+
     Ok(())
 }
 
@@ -1670,7 +1958,11 @@ async fn handle_password_dialog(app: &mut App, key: KeyEvent) -> Result<()> {
 
             match certs_result {
                 Ok(loaded) => {
-                    let status_message = describe_fetch(&entry_kind, &loaded.certs);
+                    let status_message = annotate_mtls_status(
+                        describe_fetch(&entry_kind, &loaded.certs),
+                        loaded.requires_mtls,
+                        &loaded.client_ca_names,
+                    );
                     app.update_entry_certs(
                         entry_index,
                         entry_kind.clone(),
@@ -1962,17 +2254,30 @@ async fn import_system_certificates(app: &mut App, root: PathBuf) -> Result<()> 
         let kind = TargetKind::Local { path: path.clone() };
         match load_certs_for(kind.clone(), app.settings.timeout_secs, None).await {
             Ok(loaded) => {
-                if loaded.certs.is_empty() {
+                let LoadedCerts {
+                    certs,
+                    local_format,
+                    local_is_dir,
+                    requires_mtls,
+                    client_ca_names,
+                } = loaded;
+                if certs.is_empty() {
                     skipped += 1;
                     continue;
                 }
-                let status_message = describe_fetch(&kind, &loaded.certs);
+                let status_message = annotate_mtls_status(
+                    describe_fetch(&kind, &certs),
+                    requires_mtls,
+                    &client_ca_names,
+                );
                 let entry = TargetEntry::new(
                     kind,
-                    loaded.certs,
-                    loaded.local_format,
-                    loaded.local_is_dir,
+                    certs,
+                    local_format,
+                    local_is_dir,
                     status_message.clone(),
+                    requires_mtls,
+                    client_ca_names,
                 );
                 app.upsert_entry(entry);
                 imported += 1;
@@ -2218,6 +2523,27 @@ fn describe_fetch(kind: &TargetKind, certs: &[CertInfo]) -> String {
     }
 }
 
+fn annotate_mtls_status(
+    mut base: String,
+    requires_mtls: bool,
+    client_ca_names: &[String],
+) -> String {
+    if !requires_mtls {
+        return base;
+    }
+    while base.ends_with('.') {
+        base.pop();
+    }
+    base.push_str(" — Requires mTLS");
+    if !client_ca_names.is_empty() {
+        let count = client_ca_names.len();
+        let suffix = if count == 1 { "" } else { "s" };
+        base.push_str(&format!(" ({} acceptable client CA name{})", count, suffix));
+    }
+    base.push('.');
+    base
+}
+
 fn leaf_summary(certs: &[CertInfo]) -> Option<String> {
     let leaf = certs.first()?;
     let days = days_until_expiry(leaf)?;
@@ -2252,14 +2578,18 @@ struct LoadedCerts {
     certs: Vec<CertInfo>,
     local_format: Option<LocalCertFormat>,
     local_is_dir: Option<bool>,
+    requires_mtls: bool,
+    client_ca_names: Vec<String>,
 }
 
 impl LoadedCerts {
-    fn remote(certs: Vec<CertInfo>) -> Self {
+    fn remote(certs: Vec<CertInfo>, requires_mtls: bool, client_ca_names: Vec<String>) -> Self {
         Self {
             certs,
             local_format: None,
             local_is_dir: None,
+            requires_mtls,
+            client_ca_names,
         }
     }
 
@@ -2268,6 +2598,8 @@ impl LoadedCerts {
             certs,
             local_format: Some(format),
             local_is_dir: Some(is_dir),
+            requires_mtls: false,
+            client_ca_names: Vec::new(),
         }
     }
 }
@@ -2281,14 +2613,18 @@ async fn load_certs_for(
         TargetKind::Remote { host, port } => {
             let host_for_fetch = host.clone();
             let label = format!("{}:{}", host, port);
-            let handle = tokio::task::spawn_blocking(move || -> Result<Vec<CertInfo>> {
+            let handle = tokio::task::spawn_blocking(move || -> Result<InspectReport> {
                 let report = inspect_remote(&host_for_fetch, port, None)?;
-                Ok(report.certs)
+                Ok(report)
             });
             match timeout(Duration::from_secs(timeout_secs), handle).await {
                 Ok(join_result) => {
-                    let certs = join_result??;
-                    Ok(LoadedCerts::remote(certs))
+                    let report = join_result??;
+                    Ok(LoadedCerts::remote(
+                        report.certs,
+                        report.requires_mtls,
+                        report.client_ca_names,
+                    ))
                 }
                 Err(_) => Err(anyhow!(
                     "Timed out after {}s while fetching {}",
@@ -2419,7 +2755,8 @@ fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .map(|idx| {
             let entry = &app.entries[*idx];
-            ListItem::new(history_line(entry, &app.theme))
+            let is_active = app.is_active_truststore_kind(&entry.kind);
+            ListItem::new(history_line(entry, &app.theme, is_active))
         })
         .collect();
 
@@ -2441,7 +2778,13 @@ fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn icon_for_entry(entry: &TargetEntry) -> &'static str {
     match &entry.kind {
-        TargetKind::Remote { .. } => "",
+        TargetKind::Remote { .. } => {
+            if entry.requires_mtls {
+                ""
+            } else {
+                ""
+            }
+        }
         TargetKind::Local { .. } => {
             if entry.local_is_dir.unwrap_or(false) {
                 ""
@@ -2457,15 +2800,23 @@ fn icon_for_entry(entry: &TargetEntry) -> &'static str {
     }
 }
 
-fn history_line(entry: &TargetEntry, theme: &Theme) -> Line<'static> {
+fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) -> Line<'static> {
     let color = entry.kind.color(theme);
-    let mut spans = vec![
-        Span::styled(
-            icon_for_entry(entry).to_string(),
-            Style::default().fg(color),
-        ),
-        Span::raw(" "),
-    ];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if is_active_truststore {
+        spans.push(Span::styled(
+            "".to_string(),
+            Style::default().fg(theme.success),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
+    spans.push(Span::styled(
+        icon_for_entry(entry).to_string(),
+        Style::default().fg(color),
+    ));
+    spans.push(Span::raw(" "));
 
     match &entry.kind {
         TargetKind::Local { path } => {
@@ -2681,6 +3032,12 @@ fn render_shortcuts(f: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw("/"),
             shortcut_span("O", &app.theme),
             Span::raw(": sort certificates"),
+        ]),
+        Line::from(vec![
+            shortcut_span("T", &app.theme),
+            Span::raw(": select trust store   "),
+            shortcut_span("V", &app.theme),
+            Span::raw(": verify with trust store"),
         ]),
     ];
 

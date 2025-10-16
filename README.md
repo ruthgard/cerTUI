@@ -105,6 +105,8 @@ Modals overlay the above:
 | `Enter` | Focus target input (data copied but not cleared). |
 | `Delete` / `x` | Remove entry. |
 | `s`, `i`, `n`, `d`, `o` | Sort certificates (Subject, Issuer, Not After, Days Left, Chain order). |
+| `t` | Mark the selected entry as the active trust store. |
+| `v` | Verify the selected entry against the active trust store. |
 
 **Certificates Panel**
 
@@ -158,6 +160,15 @@ Locked entries are indicated in history, and the filter bar hints at unlocking w
 
 ---
 
+## Trust Stores & Verification
+
+- Press `t` while highlighting a history entry to set it as the active trust store. The row receives a green `` check mark, and your choice is saved to the settings file so it is restored on the next launch.
+- Remote targets that demand client certificates are tagged with a lock icon (``) and surface any “acceptable client certificate CA names” exposed by the server.
+- Press `v` on another history entry to run `openssl verify` with the active trust store; the status line records whether verification succeeded and why (including OpenSSL error output when it fails).
+- If the trust store entry is deleted or locked, the active selection is automatically cleared to avoid stale validation.
+
+---
+
 ## CLI Usage
 
 ```bash
@@ -167,6 +178,8 @@ cargo run -p omarchy-cert-cli -- inspect example.com:443 --sni example.com
 # JSON output
 cargo run -p omarchy-cert-cli -- inspect-json example.com:443
 ```
+
+The CLI mirrors the TUI by reporting when a remote endpoint requests mutual TLS and listing any “acceptable client certificate CA names” advertised by the server.
 
 ---
 

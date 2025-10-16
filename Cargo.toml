@@ -24,3 +24,4 @@ crossterm = "0.27"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 time = "0.3"
+tempfile = "3"
