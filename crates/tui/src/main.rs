@@ -1610,6 +1610,8 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             KeyCode::Up => focus_prev(app),
             KeyCode::Down => focus_next(app),
+            KeyCode::Char('k') | KeyCode::Char('K') => focus_prev(app),
+            KeyCode::Char('j') | KeyCode::Char('J') => focus_next(app),
             _ => {}
         }
         return Ok(());
@@ -1689,6 +1691,7 @@ async fn handle_input_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.set_status(status_message);
             }
             app.stop_input_editing();
+            focus_section(app, Focus::History);
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -1720,7 +1723,7 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::Enter => {
-            focus_section(app, Focus::Input);
+            focus_section(app, Focus::Table);
         }
         KeyCode::Esc => focus_section(app, Focus::Input),
         KeyCode::Delete => {
@@ -1744,6 +1747,8 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char(c) => {
             let command = c.to_ascii_lowercase();
             match command {
+                'k' => app.move_selection(-1),
+                'j' => app.move_selection(1),
                 's' => app.set_sort(SortKey::Subject),
                 'i' => app.set_sort(SortKey::Issuer),
                 'n' => app.set_sort(SortKey::NotAfter),
@@ -2027,11 +2032,18 @@ fn handle_cert_modal(app: &mut App, key: KeyEvent) -> Result<()> {
             app.move_table_selection(1);
             app.open_cert_modal();
         }
-        KeyCode::Char(c) => {
-            if matches!(c, 'f' | 'F') {
-                app.open_cert_fullscreen();
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'k' => {
+                app.move_table_selection(-1);
+                app.open_cert_modal();
             }
-        }
+            'j' => {
+                app.move_table_selection(1);
+                app.open_cert_modal();
+            }
+            'f' => app.open_cert_fullscreen(),
+            _ => {}
+        },
         _ => {}
     }
     Ok(())
@@ -2047,6 +2059,8 @@ async fn handle_table_focus(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char(c) => {
             let command = c.to_ascii_lowercase();
             match command {
+                'k' => app.move_table_selection(-1),
+                'j' => app.move_table_selection(1),
                 's' => app.set_sort(SortKey::Subject),
                 'i' => app.set_sort(SortKey::Issuer),
                 'n' => app.set_sort(SortKey::NotAfter),
@@ -2857,6 +2871,130 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
     Line::from(spans)
 }
 
+fn render_certificate_background(f: &mut Frame<'_>, area: Rect, theme: &Theme, skip_lines: u16) {
+    if skip_lines >= area.height {
+        return;
+    }
+
+    let usable_height = area.height - skip_lines;
+    if usable_height == 0 {
+        return;
+    }
+
+    let glyph_lines = cer_tui_watermark_lines();
+    if glyph_lines.is_empty() {
+        return;
+    }
+
+    let content_height = glyph_lines.len() as u16;
+    let glyph_lines = if content_height > usable_height {
+        let start = ((content_height - usable_height) / 2) as usize;
+        glyph_lines
+            .into_iter()
+            .skip(start)
+            .take(usable_height as usize)
+            .collect::<Vec<_>>()
+    } else {
+        glyph_lines
+    };
+
+    let visible_height = glyph_lines.len() as u16;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+
+    for _ in 0..skip_lines {
+        lines.push(Line::from(Span::raw(String::new())));
+    }
+
+    let top_padding = if visible_height < usable_height {
+        (usable_height - visible_height) / 2
+    } else {
+        0
+    };
+    for _ in 0..top_padding {
+        lines.push(Line::from(Span::raw(String::new())));
+    }
+
+    lines.extend(glyph_lines.into_iter());
+
+    while (lines.len() as u16) < area.height {
+        lines.push(Line::from(Span::raw(String::new())));
+    }
+    if (lines.len() as u16) > area.height {
+        lines.truncate(area.height as usize);
+    }
+
+    let watermark = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .style(
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::DIM | Modifier::BOLD),
+        );
+    f.render_widget(watermark, area);
+}
+
+fn cer_tui_watermark_lines() -> Vec<Line<'static>> {
+    const HEIGHT: usize = 6;
+    const LETTER_C: [&str; HEIGHT] = [
+        "███████╗",
+        "██╔════╝",
+        "██║     ",
+        "██║     ",
+        "╚██████╗",
+        " ╚═════╝",
+    ];
+    const LETTER_E: [&str; HEIGHT] = [
+        "███████╗",
+        "██╔════╝",
+        "█████╗  ",
+        "██╔══╝  ",
+        "███████╗",
+        "╚══════╝",
+    ];
+    const LETTER_R: [&str; HEIGHT] = [
+        "██████╗ ",
+        "██╔══██╗",
+        "██████╔╝",
+        "██╔══██╗",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ];
+    const LETTER_T: [&str; HEIGHT] = [
+        "████████╗",
+        "╚══██╔══╝",
+        "   ██║   ",
+        "   ██║   ",
+        "   ██║   ",
+        "   ╚═╝   ",
+    ];
+    const LETTER_U: [&str; HEIGHT] = [
+        "██╗   ██╗",
+        "██║   ██║",
+        "██║   ██║",
+        "██║   ██║",
+        "╚██████╔╝",
+        " ╚═════╝ ",
+    ];
+    const LETTER_I: [&str; HEIGHT] = ["██╗", "██║", "██║", "██║", "██║", "╚═╝"];
+
+    let letters = [
+        &LETTER_C, &LETTER_E, &LETTER_R, &LETTER_T, &LETTER_U, &LETTER_I,
+    ];
+
+    let mut rows = vec![String::new(); HEIGHT];
+    for letter in letters {
+        for (idx, segment) in letter.iter().enumerate() {
+            rows[idx].push_str(segment);
+            rows[idx].push_str("   ");
+        }
+    }
+
+    rows.into_iter()
+        .map(|line| Line::from(Span::raw(line.trim_end().to_string())))
+        .collect()
+}
+
 fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.ensure_table_selection();
 
@@ -2898,6 +3036,9 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         (Vec::new(), 0, 0)
     };
+
+    let skip_lines = (rows.len() + 3).min(area.height as usize) as u16;
+    render_certificate_background(f, area, &app.theme, skip_lines);
 
     app.table_view = Some(TableViewCache {
         area,
@@ -3031,9 +3172,7 @@ fn render_shortcuts(f: &mut Frame<'_>, app: &App, area: Rect) {
             shortcut_span("D", &app.theme),
             Span::raw("/"),
             shortcut_span("O", &app.theme),
-            Span::raw(": sort certificates"),
-        ]),
-        Line::from(vec![
+            Span::raw(": sort certificates   "),
             shortcut_span("T", &app.theme),
             Span::raw(": select trust store   "),
             shortcut_span("V", &app.theme),
@@ -3553,8 +3692,16 @@ fn config_dir() -> Result<PathBuf> {
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(xdg).join("omarchy-cert-tui"));
     }
-    let home = env::var("HOME").context("HOME environment variable not set")?;
-    Ok(PathBuf::from(home).join(".config").join("omarchy-cert-tui"))
+    if let Ok(home) = env::var("HOME") {
+        return Ok(PathBuf::from(home).join(".config").join("omarchy-cert-tui"));
+    }
+    let system_fallback = PathBuf::from("/etc/xdg/omarchy-cert-tui");
+    if system_fallback.exists() {
+        return Ok(system_fallback);
+    }
+    let mut temp = env::temp_dir();
+    temp.push("cerTUI-config");
+    Ok(temp)
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -3569,14 +3716,28 @@ fn settings_display_path() -> String {
 }
 
 fn omarchy_theme_path() -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(xdg).join("omarchy").join("theme.json"));
+        candidates.push(PathBuf::from(xdg).join("omarchy").join("theme.json"));
     }
-    let home = env::var("HOME").context("HOME environment variable not set")?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("omarchy")
-        .join("theme.json"))
+    if let Ok(home) = env::var("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("omarchy")
+                .join("theme.json"),
+        );
+    }
+    candidates.push(PathBuf::from("/etc/xdg/omarchy/theme.json"));
+    candidates.push(config_dir()?.join("theme.json"));
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!("no theme path candidates found"))
 }
 
 fn load_theme() -> (Theme, String) {

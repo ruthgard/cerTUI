@@ -101,18 +101,18 @@ Modals overlay the above:
 
 | Key | Action |
 |-----|--------|
-| `Up` / `Down` | Move selection. |
+| `Up` / `Down` / `k` / `j` | Move selection. |
 | `Enter` | Focus target input (data copied but not cleared). |
 | `Delete` / `x` | Remove entry. |
 | `s`, `i`, `n`, `d`, `o` | Sort certificates (Subject, Issuer, Not After, Days Left, Chain order). |
-| `t` | Mark the selected entry as the active trust store. |
-| `v` | Verify the selected entry against the active trust store. |
+| `T` | Mark the selected entry as the active trust store. |
+| `V` | Verify the selected entry against the active trust store. |
 
 **Certificates Panel**
 
 | Key | Action |
 |-----|--------|
-| `Up` / `Down` | Change highlighted certificate. |
+| `Up` / `Down` / `k` / `j` | Change highlighted certificate. |
 | `Enter` | Open details modal. |
 | Sorting keys | Same as history panel. |
 
