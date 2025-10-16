@@ -1,4 +1,4 @@
-# omarchy-cert-tui
+# CerTUI
 
 Interactive terminal user interface (TUI) and supporting crates for discovering, inspecting, and organising X.509 certificates. The project is split into three crates:
 
