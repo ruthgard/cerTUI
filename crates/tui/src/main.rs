@@ -2818,6 +2818,8 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
     let color = entry.kind.color(theme);
     let mut spans: Vec<Span<'static>> = Vec::new();
 
+    let min_days_left = entry.certs.iter().filter_map(days_until_expiry).min();
+
     if is_active_truststore {
         spans.push(Span::styled(
             "".to_string(),
@@ -2844,6 +2846,17 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
                 .unwrap_or_else(|| ".".to_string());
             spans.push(Span::styled(file_name, Style::default().fg(color)));
             spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
+            if let Some(days) = min_days_left {
+                let day_color = match days {
+                    d if d < 0 => theme.danger,
+                    d if d <= 30 => theme.warning,
+                    _ => theme.success,
+                };
+                spans.push(Span::styled(
+                    format!("{days}d "),
+                    Style::default().fg(day_color),
+                ));
+            }
             spans.push(Span::styled(parent, Style::default().fg(theme.muted)));
         }
         TargetKind::Remote { .. } => {
@@ -2852,6 +2865,17 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
                 Style::default().fg(color),
             ));
             spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
+            if let Some(days) = min_days_left {
+                let day_color = match days {
+                    d if d < 0 => theme.danger,
+                    d if d <= 30 => theme.warning,
+                    _ => theme.success,
+                };
+                spans.push(Span::styled(
+                    format!("{days}d "),
+                    Style::default().fg(day_color),
+                ));
+            }
         }
     }
 

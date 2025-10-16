@@ -101,7 +101,7 @@ Modals overlay the above:
 
 | Key | Action |
 |-----|--------|
-| `Up` / `Down` / `k` / `j` | Move selection. |
+| `Up` / `Down` / `k` / `j` | Move selection; history rows now show the count and minimum days left. |
 | `Enter` | Focus target input (data copied but not cleared). |
 | `Delete` / `x` | Remove entry. |
 | `s`, `i`, `n`, `d`, `o` | Sort certificates (Subject, Issuer, Not After, Days Left, Chain order). |
