@@ -118,6 +118,7 @@ Modals overlay the above:
 | `D` | Sort history by minimum days left (press again to reverse order). |
 | `L` | Sort history by location (Local before Remote; press again to reverse). |
 | `N` | Sort history by name (ties break on days left; press again to reverse). |
+| `Shift+A` | Focus the acceptable client CA list (if present); navigate with arrows/`j`/`k`, `Enter` for details. |
 | `T` | Mark the selected entry as the active trust store. |
 | `V` | Verify the selected entry against the active trust store. |
 
@@ -176,6 +177,7 @@ Locked entries are indicated in history, and the filter bar hints at unlocking w
 ## Trust Stores & Verification
 
 - Press `t` while highlighting a history entry to set it as the active trust store. The row receives a green `` check mark, and your choice is saved to the settings file so it is restored on the next launch.
+- When a server advertises mutual TLS, press `Shift+A` to focus the acceptable client CA list (each entry is numbered `a0`, `a1`, …); navigate with arrows/`j`/`k` and press `Enter` to inspect the full distinguished name.
 - Remote targets that demand client certificates are tagged with a lock icon (``) and surface any “acceptable client certificate CA names” exposed by the server.
 - Press `v` on another history entry to run `openssl verify` with the active trust store; the status line records whether verification succeeded and why (including OpenSSL error output when it fails).
 - If the trust store entry is deleted or locked, the active selection is automatically cleared to avoid stale validation.

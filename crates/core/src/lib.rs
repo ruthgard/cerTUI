@@ -630,9 +630,45 @@ fn java_store_type_candidates(preferred: &[&str]) -> Vec<Option<String>> {
 }
 
 fn run_pkcs12(path: &Path, password: &str) -> Result<String> {
+    let attempt_args: &[&[&str]] = &[
+        &[],
+        &["-legacy"],
+        &["-provider", "legacy"],
+        &["-provider", "default", "-provider", "legacy"],
+    ];
+    let mut first_error: Option<String> = None;
+
+    for (idx, extra) in attempt_args.iter().enumerate() {
+        match run_pkcs12_once(path, password, extra) {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                let message = err.to_string();
+                if first_error.is_none() {
+                    first_error = Some(message.clone());
+                }
+                if idx == attempt_args.len() - 1 {
+                    anyhow::bail!("{}", first_error.unwrap());
+                }
+                if is_unknown_option_error(&message) {
+                    continue;
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        first_error.unwrap_or_else(|| format!("openssl pkcs12 failed for {}", path.display()))
+    );
+}
+
+fn run_pkcs12_once(path: &Path, password: &str, extra_args: &[&str]) -> Result<String> {
     let pass_arg = format!("pass:{password}");
-    let output = Command::new("openssl")
-        .arg("pkcs12")
+    let mut cmd = Command::new("openssl");
+    cmd.arg("pkcs12");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd
         .arg("-in")
         .arg(path)
         .arg("-nodes")
@@ -665,6 +701,11 @@ fn run_pkcs12(path: &Path, password: &str) -> Result<String> {
         anyhow::bail!("openssl pkcs12 produced no output for {}", path.display());
     }
     Ok(stderr)
+}
+
+fn is_unknown_option_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unknown option") || lower.contains("invalid option")
 }
 
 fn run_pkcs7(path: &Path, format: Pkcs7Format) -> Result<String> {

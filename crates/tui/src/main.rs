@@ -3,7 +3,8 @@ use std::{
     collections::HashSet,
     env,
     ffi::OsStr,
-    fs, io,
+    fs,
+    io::{self, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
@@ -16,7 +17,7 @@ use chrono::{TimeZone, Utc};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -107,6 +108,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if matches!(key.kind, KeyEventKind::Release) {
+        return Ok(());
+    }
+
     if app.find_dialog_active() {
         handle_find_dialog(app, key).await?;
         return Ok(());
@@ -114,6 +119,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     if app.password_dialog_active() {
         handle_password_dialog(app, key).await?;
+        return Ok(());
+    }
+
+    if app.mtls_ca_modal_active() {
+        handle_ca_modal(app, key)?;
         return Ok(());
     }
 
@@ -148,7 +158,33 @@ fn handle_mouse(app: &mut App, event: MouseEvent) -> Result<()> {
 
     if app.cert_fullscreen_active() {
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-            app.close_cert_fullscreen();
+            match app.copy_current_cert_pem_to_clipboard() {
+                Ok(message) => app.set_status(message),
+                Err(err) => app.set_status(format!("Failed to copy certificate PEM: {err}")),
+            }
+        }
+        return Ok(());
+    }
+
+    if app.cert_modal_active() {
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(area) = app.cert_pem_area {
+                if point_in_rect(area, x, y) {
+                    match app.copy_current_cert_pem_to_clipboard() {
+                        Ok(message) => app.set_status(message),
+                        Err(err) => {
+                            app.set_status(format!("Failed to copy certificate PEM: {err}"))
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            if let Some(area) = app.cert_modal_area {
+                if point_in_rect(area, x, y) {
+                    return Ok(());
+                }
+            }
+            app.close_cert_modal();
         }
         return Ok(());
     }
@@ -199,37 +235,6 @@ fn handle_mouse(app: &mut App, event: MouseEvent) -> Result<()> {
                                 app.ensure_table_selection();
                                 app.open_cert_modal();
                                 return Ok(());
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-
-            if let Some(area) = app.filter_area {
-                if point_in_rect(area, x, y) {
-                    match app.focus {
-                        Focus::History | Focus::HistorySearch => app.start_history_search(),
-                        Focus::Table | Focus::TableSearch => app.start_table_search(),
-                        Focus::Input => {
-                            if app.selected.is_some() {
-                                app.start_table_search();
-                            } else {
-                                app.start_history_search();
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-
-            if let Some(area) = app.cert_pem_area {
-                if point_in_rect(area, x, y) {
-                    if let Some((_, _, cert)) = app.cert_modal_info() {
-                        match copy_pem_to_clipboard(&cert.pem) {
-                            Ok(_) => app.set_status("Certificate PEM copied to clipboard."),
-                            Err(err) => {
-                                app.set_status(format!("Failed to copy certificate PEM: {err}"))
                             }
                         }
                     }
@@ -628,7 +633,6 @@ impl Theme {
     }
 }
 
-#[derive(Clone)]
 struct App {
     input: String,
     status: String,
@@ -658,8 +662,10 @@ struct App {
     input_area: Option<Rect>,
     history_view: Option<HistoryViewCache>,
     table_view: Option<TableViewCache>,
-    filter_area: Option<Rect>,
     cert_pem_area: Option<Rect>,
+    cert_modal_area: Option<Rect>,
+    mtls_ca_modal: Option<CaModal>,
+    clipboard: Option<Clipboard>,
 }
 
 impl Default for App {
@@ -693,8 +699,10 @@ impl Default for App {
             input_area: None,
             history_view: None,
             table_view: None,
-            filter_area: None,
             cert_pem_area: None,
+            cert_modal_area: None,
+            mtls_ca_modal: None,
+            clipboard: None,
         }
     }
 }
@@ -708,6 +716,11 @@ struct FindDialog {
 struct CertModal {
     entry_index: usize,
     cert_index: usize,
+}
+
+#[derive(Clone)]
+struct CaModal {
+    entry_index: usize,
 }
 
 #[derive(Clone)]
@@ -843,6 +856,7 @@ impl App {
         self.table_search_buffer.clear();
         self.history_state.select(None);
         self.table_state.select(None);
+        self.mtls_ca_modal = None;
         self.cert_modal = None;
         self.cert_fullscreen = false;
         self.password_dialog = None;
@@ -1273,6 +1287,45 @@ impl App {
         indices.get(selected).copied()
     }
 
+    fn open_mtls_ca_modal(&mut self) {
+        let Some(entry_index) = self.selected else {
+            self.set_status("No history entry selected.");
+            return;
+        };
+        let (requires_mtls, ca_names_empty) = match self.entries.get(entry_index) {
+            Some(entry) => (entry.requires_mtls, entry.client_ca_names.is_empty()),
+            None => {
+                self.set_status("Selected entry is no longer available.");
+                return;
+            }
+        };
+        if !requires_mtls {
+            self.set_status("Selected entry does not expose mutual TLS requirements.");
+            return;
+        }
+        self.mtls_ca_modal = Some(CaModal { entry_index });
+        if ca_names_empty {
+            self.set_status(
+                "Mutual TLS info shown. Server did not advertise acceptable client CAs.",
+            );
+        } else {
+            self.set_status("Mutual TLS acceptable client CAs shown. Esc to close.");
+        }
+    }
+
+    fn close_mtls_ca_modal(&mut self) {
+        self.mtls_ca_modal = None;
+    }
+
+    fn mtls_ca_modal_active(&self) -> bool {
+        self.mtls_ca_modal.is_some()
+    }
+
+    fn mtls_ca_modal_info(&self) -> Option<&TargetEntry> {
+        let modal = self.mtls_ca_modal.as_ref()?;
+        self.entries.get(modal.entry_index)
+    }
+
     fn open_cert_modal(&mut self) {
         if let Some(entry_idx) = self.selected {
             if let Some(state) = self.entry_protected(entry_idx).cloned() {
@@ -1308,6 +1361,7 @@ impl App {
         self.cert_modal = None;
         self.cert_fullscreen = false;
         self.cert_pem_area = None;
+        self.cert_modal_area = None;
     }
 
     fn open_cert_fullscreen(&mut self) {
@@ -1322,6 +1376,8 @@ impl App {
     fn close_cert_fullscreen(&mut self) {
         if self.cert_fullscreen {
             self.cert_fullscreen = false;
+            self.cert_modal_area = None;
+            self.cert_pem_area = None;
             if self.cert_modal.is_some() {
                 self.set_status("Certificate details shown. Esc to close.");
             }
@@ -1336,6 +1392,47 @@ impl App {
         let entry = self.entries.get(modal.entry_index)?;
         let cert = entry.certs.get(modal.cert_index)?;
         Some((entry, modal.cert_index, cert))
+    }
+
+    fn copy_current_cert_pem_to_clipboard(&mut self) -> Result<&'static str> {
+        let pem = self
+            .cert_modal_info()
+            .map(|(_, _, cert)| cert.pem.clone())
+            .ok_or_else(|| anyhow!("no certificate available to copy"))?;
+        match self.try_copy_system_clipboard(&pem) {
+            Ok(()) => Ok("Certificate PEM copied to clipboard."),
+            Err(system_err) => {
+                let system_message = system_err.to_string();
+                match copy_via_osc52(&pem) {
+                    Ok(()) => {
+                        eprintln!("warn: system clipboard copy failed: {system_message}");
+                        Ok("Certificate PEM copied via terminal clipboard (OSC52).")
+                    }
+                    Err(osc_err) => Err(anyhow!(
+                        "system clipboard error: {system_message}; OSC52 fallback error: {osc_err}"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn try_copy_system_clipboard(&mut self, text: &str) -> Result<()> {
+        if self.clipboard.is_none() {
+            let clipboard = Clipboard::new()?;
+            self.clipboard = Some(clipboard);
+        }
+        match self
+            .clipboard
+            .as_mut()
+            .expect("clipboard initialized")
+            .set_text(text.to_string())
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.clipboard = None;
+                Err(err.into())
+            }
+        }
     }
 
     fn start_history_search(&mut self) {
@@ -1538,6 +1635,11 @@ async fn handle_global_keys(app: &mut App, key: &KeyEvent) -> Result<bool> {
                 app.set_status(format!("Failed to clear history: {err}"));
             }
         }
+        return Ok(true);
+    }
+
+    if key.code == KeyCode::Char('A') && key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.open_mtls_ca_modal();
         return Ok(true);
     }
 
@@ -1883,6 +1985,7 @@ async fn handle_history_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 'n' => app.set_sort(SortKey::NotAfter),
                 'd' => app.set_sort(SortKey::DaysLeft),
                 'o' => app.set_sort(SortKey::Chain),
+                'm' => app.open_mtls_ca_modal(),
                 't' => {
                     if let Some(idx) = app.selected {
                         match app.activate_truststore_by_index(idx) {
@@ -2183,6 +2286,16 @@ fn handle_cert_fullscreen(app: &mut App, _key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+fn handle_ca_modal(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            app.close_mtls_ca_modal();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn handle_table_focus(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char(c) => {
@@ -2195,6 +2308,7 @@ async fn handle_table_focus(app: &mut App, key: KeyEvent) -> Result<()> {
                 'n' => app.set_sort(SortKey::NotAfter),
                 'd' => app.set_sort(SortKey::DaysLeft),
                 'o' => app.set_sort(SortKey::Chain),
+                'm' => app.open_mtls_ca_modal(),
                 _ => {}
             }
         }
@@ -2527,6 +2641,7 @@ fn focus_next(app: &mut App) {
             app.focus = Focus::History;
         }
         Focus::History => {
+            app.ensure_table_selection();
             app.focus = Focus::Table;
         }
         Focus::Table => {
@@ -2549,6 +2664,7 @@ fn focus_prev(app: &mut App) {
         Focus::Input => {
             app.stop_input_editing();
             app.ensure_selection();
+            app.ensure_table_selection();
             app.focus = Focus::Table;
         }
         Focus::History => {
@@ -2587,6 +2703,7 @@ fn focus_section(app: &mut App, target: Focus) {
         }
         Focus::Table => {
             app.ensure_selection();
+            app.ensure_table_selection();
             app.focus = Focus::Table;
         }
         Focus::HistorySearch | Focus::TableSearch => {}
@@ -2796,26 +2913,27 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .margin(1)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(12),
+            Constraint::Min(14),
             Constraint::Length(3),
-            Constraint::Length(4),
             Constraint::Length(5),
         ])
         .split(f.size());
 
     render_input(f, app, layout[0]);
     render_body(f, app, layout[1]);
-    render_filter_bar(f, app, layout[2]);
-    render_status_panel(f, app, layout[3]);
-    render_shortcuts(f, app, layout[4]);
+    render_status_panel(f, app, layout[2]);
+    render_shortcuts(f, app, layout[3]);
 
     app.cert_pem_area = None;
+    app.cert_modal_area = None;
 
     if app.find_dialog_active() {
         render_find_dialog(f, app);
     }
     if app.password_dialog_active() {
         render_password_dialog(f, app);
+    } else if app.mtls_ca_modal_active() {
+        render_ca_modal(f, app);
     } else if app.cert_fullscreen_active() {
         render_cert_fullscreen(f, app);
     } else if app.cert_modal_active() {
@@ -2860,8 +2978,8 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.history_view = None;
     app.table_view = None;
     let body_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(area);
 
     render_history_panel(f, app, body_chunks[0]);
@@ -2869,11 +2987,15 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_history_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let history_label = match (&app.history_filter, app.focus) {
-        (Some(filter), _) => format!("history (/ {filter})"),
-        (None, Focus::HistorySearch) => "history (search)".to_string(),
-        _ => "history".to_string(),
+    let history_label = if matches!(app.focus, Focus::HistorySearch) {
+        "history — filter"
+    } else if app.history_filter.is_some() {
+        "history — filtered"
+    } else {
+        "history"
     };
+
+    let history_label = history_label.to_string();
 
     let history_title = section_title('h', &history_label, &app.theme);
 
@@ -2969,45 +3091,22 @@ fn history_line(entry: &TargetEntry, theme: &Theme, is_active_truststore: bool) 
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            let parent = path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| ".".to_string());
             spans.push(Span::styled(file_name, Style::default().fg(color)));
-            spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
-            if let Some(days) = min_days_left {
-                spans.push(Span::styled(
-                    format!("{days}d "),
-                    Style::default().fg(day_color(theme, days)),
-                ));
-            }
-            spans.push(Span::styled(parent, Style::default().fg(theme.muted)));
         }
         TargetKind::Remote { .. } => {
             spans.push(Span::styled(
                 entry.label.clone(),
                 Style::default().fg(color),
             ));
-            spans.push(Span::raw(format!(" [{}] ", entry.certs.len())));
-            if let Some(days) = min_days_left {
-                spans.push(Span::styled(
-                    format!("{days}d "),
-                    Style::default().fg(day_color(theme, days)),
-                ));
-            }
         }
     }
 
-    if !entry.status.is_empty() {
-        spans.push(Span::raw(" — "));
-        let status_color = if entry.protected.is_some() {
-            theme.warning
-        } else {
-            theme.muted
-        };
+    spans.push(Span::raw(format!(" [{}]", entry.certs.len())));
+    if let Some(days) = min_days_left {
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            entry.status.clone(),
-            Style::default().fg(status_color),
+            format!("{days}d"),
+            Style::default().fg(day_color(theme, days)),
         ));
     }
 
@@ -3181,6 +3280,7 @@ fn cer_tui_watermark_lines() -> Vec<Line<'static>> {
 
 fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.ensure_table_selection();
+    let table_area = area;
 
     let mut view_indices: Vec<usize> = Vec::new();
     let (rows, total, filtered) = if let Some(entry_idx) = app.selected {
@@ -3221,11 +3321,11 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         (Vec::new(), 0, 0)
     };
 
-    let skip_lines = (rows.len() + 3).min(area.height as usize) as u16;
-    render_certificate_background(f, area, &app.theme, skip_lines);
+    let skip_lines = (rows.len() + 3).min(table_area.height as usize) as u16;
+    render_certificate_background(f, table_area, &app.theme, skip_lines);
 
     app.table_view = Some(TableViewCache {
-        area,
+        area: table_area,
         indices: view_indices,
         offset: app.table_state.offset(),
     });
@@ -3237,6 +3337,9 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
         if entry.protected.is_some() {
             base.push_str(" — password required");
+        }
+        if matches!(app.focus, Focus::TableSearch) || app.table_filter.is_some() {
+            base.push_str(" — filtered");
         }
         base
     } else {
@@ -3278,164 +3381,258 @@ fn render_table_panel(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         )
         .highlight_symbol("> ");
 
-    f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-fn render_filter_bar(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    app.filter_area = Some(area);
-    let (title, line, highlight) = match app.focus {
-        Focus::History | Focus::HistorySearch => (
-            section_title('/', "filter — history", &app.theme),
-            history_filter_line(app),
-            matches!(app.focus, Focus::HistorySearch),
-        ),
-        Focus::Table | Focus::TableSearch => (
-            section_title('/', "filter — certificates", &app.theme),
-            table_filter_line(app),
-            matches!(app.focus, Focus::TableSearch),
-        ),
-        _ => (
-            section_title('/', "filter", &app.theme),
-            Line::from(vec![
-                Span::raw("Focus "),
-                shortcut_span("H", &app.theme),
-                Span::raw(" or "),
-                shortcut_span("C", &app.theme),
-                Span::raw(" panes and press "),
-                shortcut_span("/", &app.theme),
-                Span::raw(" to filter"),
-            ]),
-            false,
-        ),
-    };
-
-    let mut block = Block::default().borders(Borders::ALL).title(title);
-    if highlight {
-        block = block.border_style(Style::default().fg(app.theme.highlight));
-    }
-
-    let paragraph = Paragraph::new(line).block(block);
-    f.render_widget(paragraph, area);
+    f.render_stateful_widget(table, table_area, &mut app.table_state);
 }
 
 fn render_shortcuts(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let lines = vec![
-        Line::from(vec![
-            shortcut_span("Enter", &app.theme),
-            Span::raw(": edit target (submit)   "),
-            shortcut_span("Esc", &app.theme),
-            Span::raw(": cancel edit   "),
-            shortcut_span("Tab", &app.theme),
-            Span::raw(": cycle focus   "),
-            shortcut_span("Ctrl+F", &app.theme),
-            Span::raw(": find certificates   "),
-            shortcut_span("Ctrl+R", &app.theme),
-            Span::raw(": refresh"),
-        ]),
-        Line::from(vec![
-            shortcut_span("/", &app.theme),
-            Span::raw(": filter list   "),
-            shortcut_span("Delete", &app.theme),
-            Span::raw("/"),
-            shortcut_span("x", &app.theme),
-            Span::raw(": remove history entry   "),
-            shortcut_span("Enter", &app.theme),
-            Span::raw(" (certs): details   "),
-            shortcut_span("F", &app.theme),
-            Span::raw(" (details): fullscreen   "),
-            shortcut_span("Ctrl+L", &app.theme),
-            Span::raw(": clear history"),
-        ]),
-        Line::from(vec![
-            shortcut_span("S", &app.theme),
-            Span::raw("/"),
-            shortcut_span("I", &app.theme),
-            Span::raw("/"),
-            shortcut_span("N", &app.theme),
-            Span::raw("/"),
-            shortcut_span("D", &app.theme),
-            Span::raw("/"),
-            shortcut_span("O", &app.theme),
-            Span::raw(": sort certificates   "),
-            shortcut_span("T", &app.theme),
-            Span::raw(": select trust store   "),
-            shortcut_span("V", &app.theme),
-            Span::raw(": verify with trust store"),
-        ]),
-    ];
+    let mut lines = global_shortcut_lines(&app.theme);
+    lines.extend(context_shortcut_lines(app));
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+
+    let title_suffix = shortcut_context_label(app)
+        .map(|label| format!(" shortcuts — {label} "))
+        .unwrap_or_else(|| " shortcuts ".to_string());
 
     let shortcuts = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" shortcuts "))
+        .block(Block::default().borders(Borders::ALL).title(title_suffix))
         .wrap(Wrap { trim: true });
     f.render_widget(shortcuts, area);
 }
 
-fn history_filter_line(app: &App) -> Line<'static> {
-    if matches!(app.focus, Focus::HistorySearch) {
-        Line::from(vec![
-            shortcut_span("/", &app.theme),
-            Span::raw(app.history_search_buffer.clone()),
-        ])
-    } else if let Some(filter) = app.history_filter.as_ref() {
-        Line::from(vec![
-            Span::raw("Active: "),
-            shortcut_span("/", &app.theme),
-            Span::raw(filter.clone()),
-        ])
-    } else {
-        Line::from(vec![
-            Span::raw("Press "),
-            shortcut_span("/", &app.theme),
-            Span::raw(" to search history"),
-        ])
+fn global_shortcut_lines(theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        shortcut_line(
+            theme,
+            &[
+                ("Tab", "next focus"),
+                ("Shift+Tab", "previous focus"),
+                ("Ctrl+F", "find"),
+                ("Ctrl+R", "refresh"),
+            ],
+        ),
+        shortcut_line(theme, &[("Ctrl+L", "clear history"), ("q", "quit")]),
+    ]
+}
+
+fn context_shortcut_lines(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+
+    if app.password_dialog_active() {
+        return vec![shortcut_line(
+            theme,
+            &[
+                ("Enter", "submit password"),
+                ("Esc", "cancel"),
+                ("Backspace", "delete character"),
+            ],
+        )];
+    }
+
+    if app.cert_fullscreen_active() {
+        return vec![shortcut_line(
+            theme,
+            &[
+                ("Any key", "exit fullscreen"),
+                ("Click", "copy PEM"),
+                ("F", "toggle fullscreen"),
+            ],
+        )];
+    }
+
+    if app.cert_modal_active() {
+        return vec![shortcut_line(
+            theme,
+            &[
+                ("Up/Down", "navigate"),
+                ("k/j", "navigate"),
+                ("Esc", "close"),
+                ("F", "fullscreen"),
+                ("Click", "copy PEM"),
+            ],
+        )];
+    }
+
+    if app.mtls_ca_modal_active() {
+        return vec![shortcut_line(
+            theme,
+            &[("Esc", "close"), ("Enter", "close")],
+        )];
+    }
+
+    match app.focus {
+        Focus::Input => {
+            if app.is_input_editing() {
+                vec![shortcut_line(
+                    theme,
+                    &[
+                        ("Enter", "load target"),
+                        ("Esc", "cancel editing"),
+                        ("Tab", "autocomplete path"),
+                    ],
+                )]
+            } else {
+                vec![shortcut_line(
+                    theme,
+                    &[
+                        ("Enter", "start editing"),
+                        ("Esc", "restore selection"),
+                        ("Up/Down", "change focus"),
+                    ],
+                )]
+            }
+        }
+        Focus::History => vec![
+            shortcut_line(
+                theme,
+                &[
+                    ("Up/Down", "navigate"),
+                    ("k/j", "navigate"),
+                    ("Enter", "view certificates"),
+                    ("/", "filter history"),
+                ],
+            ),
+            shortcut_line(
+                theme,
+                &[
+                    ("Del/x", "remove entry"),
+                    ("t", "set trust store"),
+                    ("v", "verify"),
+                    ("m", "show mTLS"),
+                    ("Shift+D/L/N", "sort history"),
+                ],
+            ),
+        ],
+        Focus::HistorySearch => vec![shortcut_line(
+            theme,
+            &[
+                ("Type", "update filter"),
+                ("Backspace", "delete"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ],
+        )],
+        Focus::Table => vec![
+            shortcut_line(
+                theme,
+                &[
+                    ("Up/Down", "navigate"),
+                    ("k/j", "navigate"),
+                    ("Enter", "certificate details"),
+                    ("/", "filter certificates"),
+                ],
+            ),
+            shortcut_line(theme, &[("s/i/n/d/o", "sort columns"), ("m", "show mTLS")]),
+        ],
+        Focus::TableSearch => vec![shortcut_line(
+            theme,
+            &[
+                ("Type", "update filter"),
+                ("Backspace", "delete"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ],
+        )],
     }
 }
 
-fn table_filter_line(app: &App) -> Line<'static> {
-    if matches!(app.focus, Focus::TableSearch) {
-        Line::from(vec![
-            shortcut_span("/", &app.theme),
-            Span::raw(app.table_search_buffer.clone()),
-        ])
-    } else if let Some(filter) = app.table_filter.as_ref() {
-        Line::from(vec![
-            Span::raw("Active: "),
-            shortcut_span("/", &app.theme),
-            Span::raw(filter.clone()),
-        ])
-    } else if let Some(entry) = app.current_entry() {
-        if entry.protected.is_some() {
-            Line::from(vec![
-                Span::raw("Locked: "),
-                shortcut_span("Enter", &app.theme),
-                Span::raw(" to unlock"),
-            ])
-        } else {
-            Line::from(vec![
-                Span::raw("Press "),
-                shortcut_span("/", &app.theme),
-                Span::raw(" to search certificates"),
-            ])
-        }
-    } else {
-        Line::from(vec![
-            Span::raw("Press "),
-            shortcut_span("/", &app.theme),
-            Span::raw(" to search certificates"),
-        ])
+fn shortcut_context_label(app: &App) -> Option<&'static str> {
+    if app.password_dialog_active() {
+        return Some("password");
     }
+    if app.cert_fullscreen_active() {
+        return Some("certificate fullscreen");
+    }
+    if app.cert_modal_active() {
+        return Some("certificate details");
+    }
+    if app.mtls_ca_modal_active() {
+        return Some("mTLS info");
+    }
+    match app.focus {
+        Focus::Input => Some(if app.is_input_editing() {
+            "target editing"
+        } else {
+            "target"
+        }),
+        Focus::History => Some("history"),
+        Focus::HistorySearch => Some("history filter"),
+        Focus::Table => Some("certificates"),
+        Focus::TableSearch => Some("certificate filter"),
+    }
+}
+
+fn shortcut_line(theme: &Theme, items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, (key, desc)) in items.iter().enumerate() {
+        spans.push(shortcut_span(key, theme));
+        if !desc.is_empty() {
+            spans.push(Span::raw(format!(": {desc}")));
+        }
+        if idx + 1 < items.len() {
+            spans.push(Span::raw("   "));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_status_panel(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(if app.status.is_empty() {
+        String::new()
+    } else {
+        app.status.clone()
+    });
+
+    match app.focus {
+        Focus::HistorySearch => {
+            let buffer = if app.history_search_buffer.is_empty() {
+                "<type to filter>".to_string()
+            } else {
+                app.history_search_buffer.clone()
+            };
+            lines.push(format!(
+                "History filter (Enter applies, Esc cancels): {}",
+                buffer
+            ));
+        }
+        _ => {
+            if let Some(filter) = app.history_filter.as_ref() {
+                lines.push(format!("History filter active: {filter}"));
+            }
+        }
+    }
+
+    match app.focus {
+        Focus::TableSearch => {
+            let buffer = if app.table_search_buffer.is_empty() {
+                "<type to filter>".to_string()
+            } else {
+                app.table_search_buffer.clone()
+            };
+            lines.push(format!(
+                "Certificate filter (Enter applies, Esc cancels): {}",
+                buffer
+            ));
+        }
+        _ => {
+            if let Some(filter) = app.table_filter.as_ref() {
+                lines.push(format!("Certificate filter active: {filter}"));
+            }
+        }
+    }
+
     let clock = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    let second_line = format!(
+    lines.push(format!(
         "Sort: {} ({})   Timeout: {}s   {}",
         app.sort_key.label(),
         app.sort_order.label(),
         app.settings.timeout_secs,
         clock
-    );
-    let content = format!("{}\n{}", app.status, second_line);
+    ));
+
+    let content = lines.join("\n");
     let status = Paragraph::new(content)
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::ALL).title(" status "));
@@ -3549,6 +3746,80 @@ fn render_find_dialog(f: &mut Frame<'_>, app: &App) {
     f.render_widget(input, chunks[2]);
 }
 
+fn render_ca_modal(f: &mut Frame<'_>, app: &App) {
+    let Some(entry) = app.mtls_ca_modal_info() else {
+        return;
+    };
+
+    let ca_count = entry.client_ca_names.len();
+    let mut width = ((f.size().width as u32 * 2) / 3) as u16;
+    width = width.max(60).min(f.size().width);
+    let mut height = (ca_count as u16)
+        .saturating_mul(3)
+        .saturating_add(10)
+        .max(10);
+    height = height.min(f.size().height);
+
+    let area = centered_rect(width, height, f.size());
+    f.render_widget(Clear, area);
+
+    let entry_title = entry.title();
+    let title = format!(" mutual TLS requirements — {} ", entry_title);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        label_span("Endpoint", &app.theme),
+        Span::raw(entry_title),
+    ]));
+    lines.push(Line::from(""));
+
+    if ca_count == 0 {
+        lines.push(Line::from(
+            "Server requires a client certificate (mTLS) but did not advertise acceptable issuers."
+                .to_string(),
+        ));
+        lines.push(Line::from(""));
+    } else {
+        lines.push(Line::from("Acceptable client certificate CA names:"));
+        lines.push(Line::from(""));
+        for name in entry.client_ca_names.iter() {
+            let parts: Vec<&str> = name
+                .split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .collect();
+            if parts.is_empty() {
+                lines.push(Line::from(vec![Span::raw(name.clone())]));
+            } else {
+                for (part_idx, part) in parts.iter().enumerate() {
+                    if part_idx == 0 {
+                        lines.push(Line::from(vec![Span::raw((*part).to_string())]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("    ".to_string()),
+                            Span::raw((*part).to_string()),
+                        ]));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        shortcut_span("Enter", &app.theme),
+        Span::raw(": close   "),
+        shortcut_span("Esc", &app.theme),
+        Span::raw(": close"),
+    ]));
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    f.render_widget(paragraph, inner);
+}
+
 fn render_cert_modal(f: &mut Frame<'_>, app: &mut App) {
     let Some((entry, idx, cert)) = app.cert_modal_info() else {
         return;
@@ -3650,10 +3921,11 @@ fn render_cert_modal(f: &mut Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: false })
         .block(pem_block);
     f.render_widget(pem, layout[1]);
+    app.cert_modal_area = Some(area);
     app.cert_pem_area = Some(layout[1]);
 }
 
-fn render_cert_fullscreen(f: &mut Frame<'_>, app: &App) {
+fn render_cert_fullscreen(f: &mut Frame<'_>, app: &mut App) {
     let Some((entry, idx, cert)) = app.cert_modal_info() else {
         return;
     };
@@ -3722,14 +3994,57 @@ fn render_cert_fullscreen(f: &mut Frame<'_>, app: &App) {
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
+    app.cert_modal_area = Some(f.size());
+    app.cert_pem_area = Some(inner);
 }
 
-fn copy_pem_to_clipboard(pem: &str) -> Result<()> {
-    let mut clipboard = Clipboard::new().context("clipboard unavailable")?;
-    clipboard
-        .set_text(pem.to_string())
-        .context("failed to copy PEM to clipboard")?;
+fn copy_via_osc52(text: &str) -> Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let sequence = format!("\x1b]52;c;{}\x07", encoded);
+    let mut stdout = io::stdout();
+    if env::var("TMUX").is_ok() {
+        let escaped = sequence.replace('\x1b', "\x1b\x1b");
+        write!(stdout, "\x1bPtmux;{}\x1b\\", escaped)
+            .context("failed to write OSC 52 sequence through tmux")?;
+    } else if env::var("STY").is_ok() {
+        write!(stdout, "\x1bP{}\x1b\\", sequence)
+            .context("failed to write OSC 52 sequence through screen")?;
+    } else {
+        write!(stdout, "{sequence}").context("failed to write OSC 52 sequence to stdout")?;
+    }
+    stdout.flush().context("failed to flush OSC 52 sequence")?;
     Ok(())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(((data.len() + 2) / 3) * 4);
+    for chunk in data.chunks(3) {
+        let bytes = match chunk {
+            [a, b, c] => (*a as u32) << 16 | (*b as u32) << 8 | (*c as u32),
+            [a, b] => (*a as u32) << 16 | (*b as u32) << 8,
+            [a] => (*a as u32) << 16,
+            _ => 0,
+        };
+        let c0 = ((bytes >> 18) & 0x3F) as usize;
+        let c1 = ((bytes >> 12) & 0x3F) as usize;
+        let c2 = ((bytes >> 6) & 0x3F) as usize;
+        let c3 = (bytes & 0x3F) as usize;
+
+        output.push(TABLE[c0] as char);
+        output.push(TABLE[c1] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[c2] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[c3] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
@@ -4162,4 +4477,117 @@ fn save_entries(entries: &[TargetEntry]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn workspace_root() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .and_then(|crates_dir| crates_dir.parent())
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn pkcs12_history_entry_unlocks_with_password() {
+        let path = workspace_root().join("mtls/badssl/badssl.com-client.p12");
+        let kind = TargetKind::Local { path };
+        let kind_label = kind.label();
+        let loaded = load_certs_for(kind, 5, Some("badssl.com".to_string()))
+            .await
+            .expect("PKCS#12 bundle should unlock via password dialog flow");
+        assert!(
+            !loaded.certs.is_empty(),
+            "expected at least one certificate from {kind_label}"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_dialog_flow_unlocks_pkcs12_entry() {
+        let path = workspace_root().join("mtls/badssl/badssl.com-client.p12");
+        let kind = TargetKind::Local { path: path.clone() };
+        let mut entry = TargetEntry::new(
+            kind.clone(),
+            Vec::new(),
+            Some(LocalCertFormat::Pkcs12),
+            Some(false),
+            "Password required".to_string(),
+            false,
+            Vec::new(),
+        );
+        entry.protected = Some(ProtectedState::new(ProtectedStoreKind::Pkcs12, None));
+
+        let mut app = App::default();
+        app.upsert_entry(entry);
+        let entry_index = app.selected.expect("entry selected");
+        app.open_password_dialog(entry_index, ProtectedStoreKind::Pkcs12);
+
+        for ch in "badssl.com".chars() {
+            handle_password_dialog(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .await
+            .expect("character input should succeed");
+        }
+
+        handle_password_dialog(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("unlocking should succeed");
+
+        let entry = app.entries.get(entry_index).expect("entry exists");
+        assert!(
+            entry.protected.is_none(),
+            "entry should no longer be marked as protected"
+        );
+        assert!(
+            !entry.certs.is_empty(),
+            "entry should have certificates after unlocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_key_events_are_ignored_in_password_dialog() {
+        let path = workspace_root().join("mtls/badssl/badssl.com-client.p12");
+        let kind = TargetKind::Local { path };
+        let mut entry = TargetEntry::new(
+            kind.clone(),
+            Vec::new(),
+            Some(LocalCertFormat::Pkcs12),
+            Some(false),
+            "Password required".to_string(),
+            false,
+            Vec::new(),
+        );
+        entry.protected = Some(ProtectedState::new(ProtectedStoreKind::Pkcs12, None));
+
+        let mut app = App::default();
+        app.upsert_entry(entry);
+        let entry_index = app.selected.expect("entry selected");
+        app.open_password_dialog(entry_index, ProtectedStoreKind::Pkcs12);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("press event should succeed");
+
+        let mut release = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        handle_key(&mut app, release)
+            .await
+            .expect("release event should be ignored");
+
+        let dialog = app
+            .password_dialog
+            .as_ref()
+            .expect("password dialog active");
+        assert_eq!(dialog.input, "b", "release event should not append");
+    }
 }

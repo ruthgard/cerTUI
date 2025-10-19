@@ -10,3 +10,4 @@ target
 .vscode
 my.pc.com.*
 selfsigned.p12
+crates/core/tests/pkcs12.rs
