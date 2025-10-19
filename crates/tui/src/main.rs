@@ -3164,10 +3164,35 @@ fn render_certificate_background(f: &mut Frame<'_>, area: Rect, theme: &Theme, s
         return;
     }
 
-    let glyph_lines = cer_tui_watermark_lines();
-    if glyph_lines.is_empty() {
+    let glyph_rows = cer_tui_watermark_rows();
+    if glyph_rows.is_empty() {
         return;
     }
+
+    let available_width = area.width as usize;
+    if available_width == 0 {
+        return;
+    }
+
+    let glyph_lines: Vec<Line<'static>> = glyph_rows
+        .into_iter()
+        .map(|row| {
+            let chars: Vec<char> = row.chars().collect();
+            if chars.is_empty() {
+                return String::new();
+            }
+            let len = chars.len();
+            let (start, end) = if len <= available_width {
+                (0, len)
+            } else {
+                let trim = len - available_width;
+                let left = trim / 2;
+                (left, left + available_width)
+            };
+            chars[start..end].iter().collect::<String>()
+        })
+        .map(|row| Line::from(Span::raw(row)))
+        .collect();
 
     let content_height = glyph_lines.len() as u16;
     let glyph_lines = if content_height > usable_height {
@@ -3217,7 +3242,7 @@ fn render_certificate_background(f: &mut Frame<'_>, area: Rect, theme: &Theme, s
     f.render_widget(watermark, area);
 }
 
-fn cer_tui_watermark_lines() -> Vec<Line<'static>> {
+fn cer_tui_watermark_rows() -> Vec<String> {
     const HEIGHT: usize = 6;
     const LETTER_C: [&str; HEIGHT] = [
         "███████╗",
@@ -3274,7 +3299,7 @@ fn cer_tui_watermark_lines() -> Vec<Line<'static>> {
     }
 
     rows.into_iter()
-        .map(|line| Line::from(Span::raw(line.trim_end().to_string())))
+        .map(|line| line.trim_end().to_string())
         .collect()
 }
 
